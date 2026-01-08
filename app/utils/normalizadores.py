@@ -25,26 +25,38 @@ def normalizar_cui(cui: Optional[int], cuis_vistos: set[int]) -> Optional[int]:
 
 
 def normalizar_expediente(expediente: Optional[int], id_mysql: int) -> str:
+    """
+    Si el expediente viene vacío o en 0, se genera uno sintético
+    claramente identificable y único.
+    """
     if expediente is None or expediente == 0:
-        return f"DUP-{id_mysql}"
+        return f"X{id_mysql}"
     return str(expediente)
 
 
 def validar_expediente_duplicado(expediente: Optional[int]) -> bool:
+    """
+    Indica si el expediente original era inválido
+    y fue reemplazado por uno sintético.
+    """
     return expediente is None or expediente == 0
 
+def normalizar_pasaporte(p):
+    if not p:
+        return None
+    p = p.strip()
+    return p if p else None
 
 def normalizar_sexo(sexo: Optional[str]) -> str:
     if not sexo:
-        return "O"
+        return None
 
     sexo = sexo.strip().upper()
     if sexo in ("M", "MASCULINO", "HOMBRE"):
         return "M"
     if sexo in ("F", "FEMENINO", "MUJER"):
         return "F"
-    return "O"
-
+    return None
 
 def normalizar_estado(estado: Optional[str]) -> str:
     if not estado:

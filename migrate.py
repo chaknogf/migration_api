@@ -11,6 +11,26 @@ from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from dotenv import load_dotenv
 import sys
+from collections import Counter
+from typing import List, Dict
+
+def imprimir_expedientes_duplicados(batch: List[Dict], contexto: str = "") -> None:
+    """
+    Detecta e imprime expedientes duplicados dentro de un batch.
+    No modifica datos, solo informa.
+    """
+    conteo = Counter(p["expediente"] for p in batch if p.get("expediente"))
+
+    duplicados = {e: c for e, c in conteo.items() if c > 1}
+
+    if duplicados:
+        print("\n⚠️  EXPEDIENTES DUPLICADOS DETECTADOS", f"[{contexto}]" if contexto else "")
+        for exp, veces in duplicados.items():
+            print(f"   🔁 {exp} → {veces} veces")
+        print("⚠️  Estos expedientes deben normalizarse antes del INSERT\n")
+        
+        
+
 
 # Importar normalizadores
 from app.utils.normalizadores import (
@@ -25,6 +45,7 @@ from app.utils.normalizadores import (
     construir_datos_extra_jsonb,
     construir_metadatos_jsonb,
     limpiar_telefono,
+    normalizar_pasaporte,
     CUIS_VISTOS
 )
 
@@ -151,8 +172,8 @@ def transformar_paciente(row):
         
         "expediente": expediente_normalizado,
         "cui": cui,
-        "pasaporte": row.get("pasaporte") or None,
-        "nombre": nombre_json,
+        "pasaporte": normalizar_pasaporte(row.get("pasaporte")),
+        "nombre": nombre_json, 
         "sexo": sexo,
         "fecha_nacimiento": fecha_nacimiento,
         "contacto": contacto_json,
@@ -250,8 +271,16 @@ def migrar_pacientes(batch_size=500):
 
                 batch.append(paciente_postgres)
 
+
                 if i % batch_size == 0:
-                    try:
+                    try:    
+                        # 🔍 Detectar duplicados ANTES del INSERT
+                        imprimir_expedientes_duplicados(
+                            batch,
+                            contexto=f"batch terminado en registro {i}"
+                        )
+                        
+                
                         postgres_db.execute(insert_query, batch)
                         postgres_db.commit()
                         stats["exitosos"] += len(batch)
@@ -269,6 +298,11 @@ def migrar_pacientes(batch_size=500):
         # Batch final
         if batch:
             try:
+                imprimir_expedientes_duplicados(
+                    batch,
+                    contexto="batch final"
+                )
+
                 postgres_db.execute(insert_query, batch)
                 postgres_db.commit()
                 stats["exitosos"] += len(batch)
