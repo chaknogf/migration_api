@@ -119,7 +119,8 @@ def transformar_paciente(row):
     es_duplicado = validar_expediente_duplicado(expediente_original)
     expediente_normalizado = normalizar_expediente(expediente_original, id_mysql)
 
-    cui = normalizar_cui(row.get("dpi"), CUIS_VISTOS)
+    cui_original = row.get("dpi")
+    cui = normalizar_cui(cui_original, CUIS_VISTOS)
     nombre_json = construir_nombre_jsonb(
         nombre=row.get("nombre"),
         apellido=row.get("apellido"),
@@ -159,6 +160,14 @@ def transformar_paciente(row):
         fecha_defuncion=row.get("fechaDefuncion"),
         hora_defuncion=row.get("hora_defuncion")
     )
+    if datos_extra_json is None:
+        datos_extra_json = {}
+
+    datos_extra_json["cuipersona"] = (
+    str(cui_original).strip()
+    if cui_original and str(cui_original).strip()
+    else None
+)
 
     estado = normalizar_estado(row.get("estado"))
     metadatos_json = construir_metadatos_jsonb(
