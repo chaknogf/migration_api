@@ -137,6 +137,20 @@ def construir_nombre_jsonb(nombre: Optional[str], apellido: Optional[str]) -> Di
 # CONTACTO
 # ============================================================================
 
+
+
+def _normalizar_codigo(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+
+    valor_str = str(valor).strip()
+
+    if valor_str.isdigit() and len(valor_str) == 3:
+        return f"0{valor_str}"
+
+    return valor_str
+
+
 def construir_contacto_jsonb(
     telefono: Optional[str],
     email: Optional[str],
@@ -147,8 +161,10 @@ def construir_contacto_jsonb(
     return {
         "domicilio": direccion,
         "vecindad": None,
-        "municipio": municipio,
-        "telefonos": limpiar_telefono(telefono)
+        "municipio": _normalizar_codigo(municipio),
+        "departamento": _normalizar_codigo(depto),
+        "telefonos": limpiar_telefono(telefono),
+        "email": email
     }
 
 # ============================================================================

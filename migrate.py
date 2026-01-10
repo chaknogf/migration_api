@@ -46,6 +46,7 @@ from app.utils.normalizadores import (
     construir_metadatos_jsonb,
     limpiar_telefono,
     normalizar_pasaporte,
+    _normalizar_codigo,
     CUIS_VISTOS
 )
 
@@ -151,7 +152,7 @@ def transformar_paciente(row):
     datos_extra_json = construir_datos_extra_jsonb(
         nacionalidad=row.get("nacionalidad"),
         depto_nac=row.get("depto_nac"),
-        lugar_nacimiento=row.get("lugar_nacimiento"),
+        lugar_nacimiento=_normalizar_codigo(row.get("lugar_nacimiento")),
         estado_civil=row.get("estado_civil"),
         educacion=row.get("educacion"),
         pueblo=row.get("pueblo"),
