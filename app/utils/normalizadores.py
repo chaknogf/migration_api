@@ -199,14 +199,41 @@ def construir_referencias_jsonb(
             return v_str
         return "otro"
 
+    def normalizar_nombre(v: str) -> str:
+        return " ".join(v.strip().lower().split())
+
     refs = []
 
+    nombre_responsable_norm = (
+        normalizar_nombre(responsable)
+        if responsable
+        else None
+    )
+
     if padre:
-        refs.append({"nombre": padre.strip(), "parentesco": "padre", "telefono": None})
+        if not nombre_responsable_norm or normalizar_nombre(padre) != nombre_responsable_norm:
+            refs.append({
+                "nombre": padre.strip(),
+                "parentesco": "padre",
+                "telefono": None
+            })
+
     if madre:
-        refs.append({"nombre": madre.strip(), "parentesco": "madre", "telefono": None})
+        if not nombre_responsable_norm or normalizar_nombre(madre) != nombre_responsable_norm:
+            refs.append({
+                "nombre": madre.strip(),
+                "parentesco": "madre",
+                "telefono": None
+            })
+
     if conyugue:
-        refs.append({"nombre": conyugue.strip(), "parentesco": "esposo/a", "telefono": None})
+        if not nombre_responsable_norm or normalizar_nombre(conyugue) != nombre_responsable_norm:
+            refs.append({
+                "nombre": conyugue.strip(),
+                "parentesco": "esposo/a",
+                "telefono": None
+            })
+
     if responsable:
         refs.append({
             "nombre": responsable.strip(),
@@ -215,7 +242,6 @@ def construir_referencias_jsonb(
         })
 
     return refs if refs else None
-
 # ============================================================================
 # DATOS EXTRA Y METADATOS
 # ============================================================================
