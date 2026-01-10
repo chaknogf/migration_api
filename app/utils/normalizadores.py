@@ -187,9 +187,17 @@ def construir_referencias_jsonb(
 ) -> Optional[list[dict]]:
 
     def normalizar_parentesco(v):
-        if isinstance(v, str):
-            return v.lower()
-        return PARENTESCOS_MAP.get(v, "otro")
+        if v is None:
+            return "otro"
+        try:
+            v_int = int(v)
+            return PARENTESCOS_MAP.get(v_int, "otro")
+        except (ValueError, TypeError):
+            pass
+        v_str = str(v).strip().lower()
+        if v_str in PARENTESCOS_MAP.values():
+            return v_str
+        return "otro"
 
     refs = []
 
@@ -246,10 +254,10 @@ def construir_datos_extra_jsonb(
 
 def construir_metadatos_jsonb(id_mysql: int, created_by: Optional[str], expediente_duplicado: bool) -> Dict[str, Any]:
     return {
-        "sistema_origen": "mysql_legacy",
-        "id_origen": id_mysql,
+        "sistema_origen": "test_api",
         "creado_por": created_by,
-        "migrado_en": datetime.now().isoformat(),
-        "version_migracion": "1.0",
         "expediente_duplicado": expediente_duplicado
     }
+    
+    
+    
