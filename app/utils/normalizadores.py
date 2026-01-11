@@ -311,15 +311,15 @@ def construir_datos_extra_jsonb(
 
     return {
         "demograficos": {
-            "nacionalidad_id": normalizar_nacionalidad(nacionalidad),
-            "departamento_nacimiento_id": depto_nac,
-            "lugar_nacimiento_id": lugar_nacimiento,
-            "estado_civil_id": estado_civil,
-            "pueblo_id": pueblo,
-            "idioma_id": idioma
+            "nacionalidad": normalizar_nacionalidad(nacionalidad),
+            "departamento_nacimiento": depto_nac,
+            "lugar_nacimiento": lugar_nacimiento,
+            "pueblo": pueblo,
+            "idioma": idioma
         },
         "socioeconomicos": {
-            "educacion_id": educacion,
+            "estado_civil": estado_civil,
+            "educacion": educacion,
             "ocupacion": ocupacion
         },
         "defuncion": {
