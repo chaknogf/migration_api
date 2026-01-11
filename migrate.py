@@ -47,6 +47,7 @@ from app.utils.normalizadores import (
     limpiar_telefono,
     normalizar_pasaporte,
     _normalizar_codigo,
+    normalizar_nacionalidad,
     CUIS_VISTOS
 )
 

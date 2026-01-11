@@ -1,5 +1,5 @@
 import re
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 from datetime import datetime, time
 
 CUIS_VISTOS: set[int] = set()
@@ -47,15 +47,21 @@ def normalizar_pasaporte(p):
     p = p.strip()
     return p if p else None
 
-def normalizar_sexo(sexo: Optional[str]) -> str:
+def normalizar_sexo(sexo: Optional[str]) -> Optional[str]:
     if not sexo:
         return None
 
-    sexo = sexo.strip().upper()
-    if sexo in ("M", "MASCULINO", "HOMBRE"):
+    # Elimina todo lo que no sea letra
+    limpio = re.sub(r"[^A-Za-z]", "", sexo).upper()
+
+    if not limpio:
+        return None
+
+    if limpio[0] == "M":
         return "M"
-    if sexo in ("F", "FEMENINO", "MUJER"):
+    if limpio[0] == "F":
         return "F"
+
     return None
 
 def normalizar_estado(estado: Optional[str]) -> str:
@@ -261,6 +267,34 @@ def construir_referencias_jsonb(
 # ============================================================================
 # DATOS EXTRA Y METADATOS
 # ============================================================================
+NACIONALIDADES_MAP = {
+    1: 'GTM',
+    2: 'BLZ',
+    3: 'SLV',
+    4: 'HND',
+    5: 'NIC',
+    6: 'CRI',
+    7: 'PAN',
+    8: 'MEX',
+    9: 'OTRO',
+    0: 'NO_INDICA'
+}
+  
+def normalizar_nacionalidad(nacionalidad: Optional[int]) -> str:
+    DEFAULT = "GTM"
+
+    if nacionalidad is None:
+        return DEFAULT
+
+    try:
+        nacionalidad = int(nacionalidad)
+    except (TypeError, ValueError):
+        return DEFAULT
+
+    if nacionalidad == 0:
+        return DEFAULT
+
+    return NACIONALIDADES_MAP.get(nacionalidad, DEFAULT)
 
 def construir_datos_extra_jsonb(
     nacionalidad, depto_nac, lugar_nacimiento,
@@ -277,7 +311,7 @@ def construir_datos_extra_jsonb(
 
     return {
         "demograficos": {
-            "nacionalidad_id": nacionalidad,
+            "nacionalidad_id": normalizar_nacionalidad(nacionalidad),
             "departamento_nacimiento_id": depto_nac,
             "lugar_nacimiento_id": lugar_nacimiento,
             "estado_civil_id": estado_civil,
