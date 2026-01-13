@@ -165,7 +165,7 @@ def transformar_paciente(row):
     if datos_extra_json is None:
         datos_extra_json = {}
 
-    datos_extra_json["cuipersona"] = (
+    datos_extra_json["personaid"] = (
     str(cui_original).strip()
     if cui_original and str(cui_original).strip()
     else None
