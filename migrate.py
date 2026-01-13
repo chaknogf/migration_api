@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#migrate.py
 """
 Script de migración específico para tabla PACIENTES
 Transforma estructura relacional MySQL -> estructura JSONB PostgreSQL
@@ -14,6 +15,7 @@ import sys
 from collections import Counter
 from typing import List, Dict
 
+
 def imprimir_expedientes_duplicados(batch: List[Dict], contexto: str = "") -> None:
     """
     Detecta e imprime expedientes duplicados dentro de un batch.
@@ -28,7 +30,6 @@ def imprimir_expedientes_duplicados(batch: List[Dict], contexto: str = "") -> No
         for exp, veces in duplicados.items():
             print(f"   🔁 {exp} → {veces} veces")
         print("⚠️  Estos expedientes deben normalizarse antes del INSERT\n")
-        
         
 
 
@@ -123,20 +124,21 @@ def transformar_paciente(row):
 
     cui_original = row.get("dpi")
     cui = normalizar_cui(cui_original, CUIS_VISTOS)
+    
     nombre_json = construir_nombre_jsonb(
         nombre=row.get("nombre"),
         apellido=row.get("apellido"),
     )
+    
     sexo = normalizar_sexo(row.get("sexo"))
     fecha_nacimiento = row.get("nacimiento")
 
     telefono_limpio = limpiar_telefono(row.get("telefono"))
     contacto_json = construir_contacto_jsonb(
-        telefono=telefono_limpio,
+        telefonos=telefono_limpio,
         email=row.get("email"),
-        direccion=row.get("direccion"),
-        municipio=row.get("municipio"),
-        depto=row.get("depto")
+        domicilio=row.get("direccion"),
+        municipio=row.get("municipio")
     )
 
     telefono_responsable_limpio = limpiar_telefono(row.get("telefono_responsable"))
@@ -150,26 +152,32 @@ def transformar_paciente(row):
         conyugue=row.get("conyugue")
     )
 
+    # Obtener personaid del CUI original
+    personaid = (
+        str(cui_original).strip()
+        if cui_original and str(cui_original).strip()
+        else None
+    )
+
     datos_extra_json = construir_datos_extra_jsonb(
         nacionalidad=row.get("nacionalidad"),
         depto_nac=row.get("depto_nac"),
-        lugar_nacimiento=_normalizar_codigo(row.get("lugar_nacimiento")),
+        lugar_nacimiento=row.get("lugar_nacimiento"),
         estado_civil=row.get("estado_civil"),
         educacion=row.get("educacion"),
         pueblo=row.get("pueblo"),
         idioma=row.get("idioma"),
         ocupacion=row.get("ocupacion"),
         fecha_defuncion=row.get("fechaDefuncion"),
-        hora_defuncion=row.get("hora_defuncion")
+        hora_defuncion=row.get("hora_defuncion"),
+        peso_nacimiento=row.get("peso_nacimiento"),
+        edad_gestacional=row.get("edad_gestacional"),
+        parto=row.get("parto"),
+        gemelo=row.get("gemelo"),
+        expediente_madre=row.get("expediente_madre"),
+        extrahospitalario=row.get("extrahospitalario"),
+        personaid=personaid
     )
-    if datos_extra_json is None:
-        datos_extra_json = {}
-
-    datos_extra_json["personaid"] = (
-    str(cui_original).strip()
-    if cui_original and str(cui_original).strip()
-    else None
-)
 
     estado = normalizar_estado(row.get("estado"))
     metadatos_json = construir_metadatos_jsonb(
@@ -180,7 +188,6 @@ def transformar_paciente(row):
     
 
     paciente_postgres = {
-        
         "expediente": expediente_normalizado,
         "cui": cui,
         "pasaporte": normalizar_pasaporte(row.get("pasaporte")),
@@ -204,12 +211,10 @@ def transformar_paciente(row):
 
 insert_query = text("""
 INSERT INTO pacientes (
-  
     expediente, cui, pasaporte, nombre, sexo, fecha_nacimiento,
     contacto, referencias, datos_extra, estado, metadatos,
     creado_en, actualizado_en
 ) VALUES (
-    
     :expediente,
     :cui,
     :pasaporte,
@@ -225,7 +230,6 @@ INSERT INTO pacientes (
     :actualizado_en
 )
 ON CONFLICT (expediente) DO UPDATE SET
-   
     cui = EXCLUDED.cui,
     pasaporte = EXCLUDED.pasaporte,
     nombre = EXCLUDED.nombre,
@@ -291,7 +295,6 @@ def migrar_pacientes(batch_size=500):
                             contexto=f"batch terminado en registro {i}"
                         )
                         
-                
                         postgres_db.execute(insert_query, batch)
                         postgres_db.commit()
                         stats["exitosos"] += len(batch)
