@@ -1,14 +1,32 @@
 # app/utils/normalizadores.py
 import re
-from typing import Dict, Optional, Any, Union
-from datetime import datetime, time
+from typing import Dict, Optional, Any, Union, List
+from datetime import datetime, time, date
 
 
 CUIS_VISTOS: set[int] = set()
 
+
+
+def json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return obj
 # ============================================================================
 # NORMALIZADORES BÁSICOS
 # ============================================================================
+
+# def normalizar_cui(cui: Optional[int]) -> Optional[int]:
+#     if not cui:
+#         return None
+#     cui_str = str(cui).strip()
+#     if len(cui_str) != 13 or not cui_str.isdigit():
+#         return None
+#     return int(cui_str)
 
 def normalizar_cui(cui: Optional[int], cuis_vistos: set[int]) -> Optional[int]:
     if not cui:
@@ -437,11 +455,15 @@ def construir_datos_extra_jsonb(
 def construir_metadatos_jsonb(
     id_mysql: int,
     created_by: Optional[str],
+    created_at: Optional[str],
     expediente_duplicado: bool
-) -> Dict[str, Any]:
-    """Construye metadatos de migración"""
-    return {
-        "sistema_origen": "test_api",
-        "creado_por": created_by,
-        "expediente_duplicado": expediente_duplicado
-    }
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "accion": "CREADO",
+            "usuario": created_by,
+            "registro": created_at or datetime.now().isoformat(),
+            "expediente_duplicado": expediente_duplicado,
+            "origen_mysql_id": id_mysql
+        }
+    ]

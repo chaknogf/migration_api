@@ -49,6 +49,7 @@ from app.utils.normalizadores import (
     normalizar_pasaporte,
     _normalizar_codigo,
     normalizar_nacionalidad,
+    json_safe,
     CUIS_VISTOS
 )
 
@@ -183,6 +184,7 @@ def transformar_paciente(row):
     metadatos_json = construir_metadatos_jsonb(
         id_mysql=id_mysql,
         created_by=row.get("created_by"),
+        created_at=row.get("created_at"),
         expediente_duplicado=es_duplicado
     )
     
@@ -198,7 +200,7 @@ def transformar_paciente(row):
         "referencias": referencias_json,
         "datos_extra": datos_extra_json,
         "estado": estado,
-        "metadatos": metadatos_json,
+        "metadatos": json_safe(metadatos_json),
         "creado_en": row.get("created_at", datetime.now()),
         "actualizado_en": row.get("update_at")
     }
