@@ -62,7 +62,7 @@ load_dotenv()
 
 def construir_url_mysql():
     user = os.getenv("MYSQL_USER", "root")
-    password = os.getenv("MYSQL_PASSWORD", "")
+    password = os.getenv("MYSQL_PASSWORD", "Prometeus.0")
     host = os.getenv("MYSQL_HOST", "localhost")
     port = os.getenv("MYSQL_PORT", "3306")
     database = os.getenv("MYSQL_DATABASE", "test_api")
@@ -70,7 +70,7 @@ def construir_url_mysql():
 
 def construir_url_postgres():
     user = os.getenv("POSTGRES_USER", "postgres")
-    password = os.getenv("POSTGRES_PASSWORD", "")
+    password = os.getenv("POSTGRES_PASSWORD", "secreto123")
     host = os.getenv("POSTGRES_HOST", "localhost")
     port = os.getenv("POSTGRES_PORT", "5432")
     database = os.getenv("POSTGRES_DB", "hospital")
