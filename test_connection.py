@@ -131,12 +131,12 @@ try:
         tablas = [row[0] for row in result]
         if tablas:
             print(f"      Encontradas {len(tablas)} tablas:")
-            for tabla in tablas[:10]:  # Mostrar máximo 10
+            for tabla in tablas[:14]:  # Mostrar máximo 10
                 # Contar registros
                 count = conn.execute(text(f"SELECT COUNT(*) FROM {tabla}")).scalar()
                 print(f"      - {tabla:30s} ({count:,} registros)")
-            if len(tablas) > 10:
-                print(f"      ... y {len(tablas) - 10} más")
+            if len(tablas) > 14:
+                print(f"      ... y {len(tablas) - 14} más")
         else:
             print("      ⚠️  No hay tablas")
 except Exception as e:
@@ -153,12 +153,12 @@ try:
         tablas = [row[0] for row in result]
         if tablas:
             print(f"      Encontradas {len(tablas)} tablas:")
-            for tabla in tablas[:10]:  # Mostrar máximo 10
+            for tabla in tablas[:13]:  # Mostrar máximo 10
                 # Contar registros
                 count = conn.execute(text(f"SELECT COUNT(*) FROM {tabla}")).scalar()
                 print(f"      - {tabla:30s} ({count:,} registros)")
-            if len(tablas) > 10:
-                print(f"      ... y {len(tablas) - 10} más")
+            if len(tablas) > 13:
+                print(f"      ... y {len(tablas) - 13} más")
         else:
             print("      ⚠️  No hay tablas (base de datos vacía)")
 except Exception as e:
