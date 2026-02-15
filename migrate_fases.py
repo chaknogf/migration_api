@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#migrate_fases.py
 """
 MIGRACIÓN POR FASES CON TRAZABILIDAD COMPLETA
 
@@ -33,6 +32,20 @@ from app.utils.normalizadores import (
     normalizar_pasaporte,
     json_safe,
     CUIS_VISTOS
+)
+
+# Importar normalizadores de consultas
+from app.utils.normalizadores_consultas import (
+    normalizar_consulta_completa,
+    normalizar_tipo_consulta,
+    normalizar_especialidad,
+    normalizar_servicio,
+    normalizar_hoja_emergencia,
+    normalizar_diagnostico,
+    normalizar_medico,
+    normalizar_fecha_consulta,
+    normalizar_hora_consulta,
+    validar_consulta_completa
 )
 
 load_dotenv()
@@ -123,13 +136,30 @@ INSERT INTO consultas (
 # ============================================================================
 
 def construir_indicadores_jsonb(consulta: Dict) -> Optional[Dict]:
-    """Construye indicadores desde consulta completa"""
+    """
+    Construye indicadores desde consulta normalizada
+    prenatal y lactancia son integers que se convierten a boolean si > 0
+    """
     indicadores = {}
     
+    # prenatal y lactancia son integers, convertir a boolean si hay valor
     if consulta.get("prenatal"):
-        indicadores["prenatal"] = bool(consulta["prenatal"])
+        try:
+            prenatal_val = int(consulta["prenatal"])
+            if prenatal_val > 0:
+                indicadores["prenatal"] = True
+        except (ValueError, TypeError):
+            pass
+    
     if consulta.get("lactancia"):
-        indicadores["lactancia"] = bool(consulta["lactancia"])
+        try:
+            lactancia_val = int(consulta["lactancia"])
+            if lactancia_val > 0:
+                indicadores["lactancia"] = True
+        except (ValueError, TypeError):
+            pass
+    
+    # Estos ya son booleanos
     if consulta.get("bomberos"):
         indicadores["bomberos"] = True
     if consulta.get("transito"):
@@ -149,57 +179,60 @@ def construir_indicadores_jsonb(consulta: Dict) -> Optional[Dict]:
     
     return indicadores if indicadores else None
 
-def construir_ciclo_jsonb(consulta: Dict) -> Dict:
-    """Construye ciclo desde consulta completa"""
-    return {
-        "id_mysql": consulta.get("id"),
-        "hoja_emergencia": consulta.get("hoja_emergencia"),
-        "acompanante": consulta.get("acompa"),
-        "parentesco_acompanante": consulta.get("parente"),
-        "notas": consulta.get("nota"),
-        "diagnostico": consulta.get("dx"),
-        "folios": consulta.get("folios"),
-        "medico": consulta.get("medico"),
-        "fecha_egreso": str(consulta.get("fecha_egreso")) if consulta.get("fecha_egreso") else None,
-        "fecha_recepcion": str(consulta.get("fecha_recepcion")) if consulta.get("fecha_recepcion") else None,
-        "status": consulta.get("status"),
-        "consulta_por": consulta.get("consulta_por"),
-        "created_by": consulta.get("created_by"),
-        "archived_by": consulta.get("archived_by")
-    }
-
-def transformar_paciente(row: Dict) -> Dict:
-    """Transforma paciente MySQL → PostgreSQL usando normalizadores"""
+def transformar_paciente(row: Dict) -> tuple[Dict, bool, bool]:
+    """
+    Transforma paciente MySQL → PostgreSQL usando normalizadores
+    IGUAL que migrate.py - retorna (paciente_pg, es_duplicado, cui_invalido)
+    """
     
     id_mysql = row.get("id")
     expediente_original = row.get("expediente")
     es_duplicado = validar_expediente_duplicado(expediente_original)
     expediente_normalizado = normalizar_expediente(expediente_original, id_mysql)
     
-    cui = normalizar_cui(row.get("dpi"), CUIS_VISTOS)
+    # Normalizar CUI igual que migrate.py
+    cui_original = row.get("dpi")
+    cui = normalizar_cui(cui_original, CUIS_VISTOS)
     
+    # Construir nombre JSONB
     nombre_json = construir_nombre_jsonb(
-        row.get("nombre"),
-        row.get("apellido")
+        nombre=row.get("nombre"),
+        apellido=row.get("apellido")
     )
     
+    # Normalizar sexo
+    sexo = normalizar_sexo(row.get("sexo"))
+    fecha_nacimiento = row.get("nacimiento")
+    
+    # Construir contacto JSONB con teléfono limpio
+    telefono_limpio = limpiar_telefono(row.get("telefono"))
     contacto_json = construir_contacto_jsonb(
-        limpiar_telefono(row.get("telefono")),
-        row.get("email"),
-        row.get("direccion"),
-        row.get("municipio")
+        telefonos=telefono_limpio,
+        email=row.get("email"),
+        domicilio=row.get("direccion"),
+        municipio=row.get("municipio")
     )
     
+    # Construir referencias JSONB con teléfono responsable limpio
+    telefono_responsable_limpio = limpiar_telefono(row.get("telefono_responsable"))
     referencias_json = construir_referencias_jsonb(
-        row.get("padre"),
-        row.get("madre"),
-        row.get("responsable"),
-        row.get("parentesco"),
-        row.get("dpi_responsable"),
-        limpiar_telefono(row.get("telefono_responsable")),
-        row.get("conyugue")
+        padre=row.get("padre"),
+        madre=row.get("madre"),
+        responsable=row.get("responsable"),
+        parentesco_responsable=row.get("parentesco"),
+        dpi_responsable=row.get("dpi_responsable"),
+        telefono_responsable=telefono_responsable_limpio,
+        conyugue=row.get("conyugue")
     )
     
+    # Obtener personaid del CUI original
+    personaid = (
+        str(cui_original).strip()
+        if cui_original and str(cui_original).strip()
+        else None
+    )
+    
+    # Construir datos_extra JSONB COMPLETO
     datos_extra_json = construir_datos_extra_jsonb(
         nacionalidad=row.get("nacionalidad"),
         depto_nac=row.get("depto_nac"),
@@ -211,63 +244,98 @@ def transformar_paciente(row: Dict) -> Dict:
         ocupacion=row.get("ocupacion"),
         fecha_defuncion=row.get("fechaDefuncion"),
         hora_defuncion=row.get("hora_defuncion"),
-        personaid=str(row.get("dpi")).strip() if row.get("dpi") else None
+        peso_nacimiento=row.get("peso_nacimiento"),
+        edad_gestacional=row.get("edad_gestacional"),
+        parto=row.get("parto"),
+        gemelo=row.get("gemelo"),
+        expediente_madre=row.get("exp_madre"),
+        extrahospitalario=row.get("extrahospitalario"),
+        personaid=personaid
     )
     
+    # Normalizar estado
+    estado = normalizar_estado(row.get("estado"))
+    
+    # Construir metadatos JSONB
     metadatos_json = construir_metadatos_jsonb(
-        id_mysql,
-        row.get("created_by"),
-        row.get("created_at"),
-        es_duplicado
+        id_mysql=id_mysql,
+        created_by=row.get("created_by"),
+        created_at=row.get("created_at"),
+        expediente_duplicado=es_duplicado
     )
     
-    return {
+    paciente_postgres = {
         "expediente": expediente_normalizado,
         "cui": cui,
         "pasaporte": normalizar_pasaporte(row.get("pasaporte")),
         "nombre": nombre_json,
-        "sexo": normalizar_sexo(row.get("sexo")),
-        "fecha_nacimiento": row.get("nacimiento"),
+        "sexo": sexo,
+        "fecha_nacimiento": fecha_nacimiento,
         "contacto": contacto_json,
         "referencias": referencias_json,
         "datos_extra": datos_extra_json,
-        "estado": normalizar_estado(row.get("estado")),
+        "estado": estado,
         "metadatos": json_safe(metadatos_json),
         "creado_en": row.get("created_at", datetime.now()),
         "actualizado_en": row.get("update_at", datetime.now())
     }
+    
+    return paciente_postgres, es_duplicado, cui is None
 
 def transformar_consulta(row: Dict, paciente_id: int, expediente: str) -> Optional[Dict]:
-    """Transforma consulta MySQL → PostgreSQL"""
+    """
+    Transforma consulta MySQL → PostgreSQL CON NORMALIZACIÓN
+    """
     
-    if not all([
-        row.get("tipo_consulta"),
-        row.get("especialidad"),
-        row.get("servicio"),
-        row.get("fecha_consulta"),
-        row.get("hora")
-    ]):
+    # Primero normalizar la consulta completa
+    consulta_normalizada = normalizar_consulta_completa(row)
+    
+    if not consulta_normalizada:
         return None
     
-    indicadores = construir_indicadores_jsonb(row)
-    ciclo = construir_ciclo_jsonb(row)
+    # Construir indicadores y ciclo con datos normalizados
+    indicadores = construir_indicadores_jsonb(consulta_normalizada)
+    ciclo = construir_ciclo_jsonb_normalizado(consulta_normalizada)
     
     return {
         "expediente": expediente,
         "paciente_id": paciente_id,
-        "tipo_consulta": row.get("tipo_consulta"),
-        "especialidad": str(row.get("especialidad")),
-        "servicio": str(row.get("servicio")),
-        "documento": row.get("hoja_emergencia"),
-        "fecha_consulta": row.get("fecha_consulta"),
-        "hora_consulta": row.get("hora"),
+        "tipo_consulta": consulta_normalizada["tipo_consulta"],
+        "especialidad": consulta_normalizada["especialidad"],
+        "servicio": consulta_normalizada["servicio"],
+        "documento": consulta_normalizada["hoja_emergencia"],
+        "fecha_consulta": consulta_normalizada["fecha_consulta"],
+        "hora_consulta": consulta_normalizada["hora_consulta"],
         "indicadores": indicadores,
         "ciclo": ciclo,
         "orden": None,
-        "creado_en": row.get("created_at", datetime.now()),
-        "actualizado_en": row.get("updated_at", datetime.now()),
+        "creado_en": consulta_normalizada.get("created_at", datetime.now()),
+        "actualizado_en": consulta_normalizada.get("updated_at", datetime.now()),
         "activo": True
     }
+
+def construir_ciclo_jsonb_normalizado(consulta: Dict) -> Dict:
+    """Construye ciclo desde consulta NORMALIZADA"""
+    ciclo = {
+        "id_mysql": consulta.get("id"),
+        "hoja_emergencia": consulta.get("hoja_emergencia"),
+        "diagnostico": consulta.get("diagnostico"),
+        "medico": consulta.get("medico"),
+        "status": consulta.get("status"),
+        "acompanante": consulta.get("acompanante"),
+        "parentesco_acompanante": consulta.get("parentesco_acompanante"),
+        "notas": consulta.get("notas"),
+        "folios": consulta.get("folios"),
+        "fecha_egreso": str(consulta.get("fecha_egreso")) if consulta.get("fecha_egreso") else None,
+        "fecha_recepcion": str(consulta.get("fecha_recepcion")) if consulta.get("fecha_recepcion") else None,
+        "consulta_por": consulta.get("consulta_por"),
+        "created_by": consulta.get("created_by"),
+        "archived_by": consulta.get("archived_by"),
+        "estado": "recepcion"  # Estado por defecto
+    }
+    
+    # Limpiar valores None
+    return {k: v for k, v in ciclo.items() if v is not None}
 
 # ============================================================================
 # FASE 1: PACIENTES PRINCIPALES + CONSULTAS CON EXPEDIENTE EXACTO
@@ -307,7 +375,7 @@ def fase1_pacientes_y_consultas_exactas():
         for paciente_row in pacientes:
             try:
                 paciente_dict = dict(paciente_row._mapping)
-                paciente_pg = transformar_paciente(paciente_dict)
+                paciente_pg, es_duplicado, cui_invalido = transformar_paciente(paciente_dict)
                 
                 # Insertar y obtener ID
                 resultado = postgres_db.execute(insert_paciente_query, paciente_pg)
