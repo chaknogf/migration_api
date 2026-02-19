@@ -306,10 +306,10 @@ def crear_paciente_desde_consulta(consulta_dict: Dict, postgres_db) -> Tuple[int
         "estado": "V",
         "metadatos": json_safe([{
             "accion": "CREADO",
-            "usuario": "SISTEMA_URGENCIAS",
+            "usuario": consulta_dict.get("created_by") or "sys",
             "registro": datetime.now().isoformat(),
             "expediente_duplicado": False,
-            "origen": "URGENCIA_SIN_EXPEDIENTE",
+            "origen": "2chance",
             "origen_mysql_consulta_id": consulta_dict.get("id")
         }]),
         "creado_en": datetime.now(),
