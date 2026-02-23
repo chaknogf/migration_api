@@ -3,12 +3,15 @@
 Script: asociar_expediente.py
 
 Asocia expedientes a consultas tipo 1 y 2 sin expediente
-comparando nombres y apellidos con la tabla pacientes
+comparando:
+- Nombres: coincidencia EXACTA (=)
+- Apellidos: coincidencia INICIAL (LIKE 'apellido%')
 
 IMPORTANTE: 
 - Solo trabaja en MySQL
 - Solo afecta consultas tipo 1 y 2
-- Requiere coincidencia exacta de nombres y apellidos
+- Nombres debe coincidir exactamente
+- Apellidos solo necesita coincidir al inicio
 """
 
 import os
@@ -38,7 +41,9 @@ print("=" * 80)
 print("🔗 ASOCIAR EXPEDIENTES A CONSULTAS TIPO 1 Y 2")
 print("=" * 80)
 print("\n⚠️  Este script SOLO actualiza MySQL")
-print("   Asocia expedientes comparando nombres y apellidos")
+print("   Compara:")
+print("   - Nombres: coincidencia EXACTA (=)")
+print("   - Apellidos: coincidencia INICIAL (LIKE 'apellido%')")
 print("=" * 80)
 
 # ============================================================================
@@ -208,18 +213,18 @@ def asociar_expedientes():
                     stats["sin_coincidencia"] += 1
                     continue
                 
-                # Buscar en pacientes por nombres y apellidos
+                # Buscar en pacientes por nombres (exacto) y apellidos (inicio con LIKE)
                 resultado_pac = mysql_db.execute(text("""
                     SELECT expediente
                     FROM pacientes
                     WHERE LOWER(TRIM(nombre)) = :nombres
-                    AND LOWER(TRIM(apellido)) = :apellidos
+                    AND LOWER(TRIM(apellido)) LIKE :apellidos_like
                     AND expediente IS NOT NULL
                     AND expediente != 0
                     LIMIT 2
                 """), {
                     "nombres": nombres_norm,
-                    "apellidos": apellidos_norm
+                    "apellidos_like": f"{apellidos_norm}%"  # LIKE con % al final
                 })
                 
                 pacientes = resultado_pac.fetchall()
@@ -307,6 +312,270 @@ def verificar_resultado():
     print(f"   ❌ Sin expediente:         {sin_expediente:,} ({sin_expediente/total*100:.1f}%)")
 
 # ============================================================================
+# GENERAR REPORTE CSV
+# ============================================================================
+
+def generar_reporte_no_asociadas():
+    """Genera CSV con consultas tipo 1 y 2 que no se pudieron asociar"""
+    
+    print("\n" + "=" * 80)
+    print("📄 GENERANDO REPORTE DE CONSULTAS NO ASOCIADAS")
+    print("=" * 80)
+    
+    import csv
+    
+    # Nombre del archivo
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"consultas_tipo12_no_asociadas_{timestamp}.csv"
+    
+    print(f"\n📄 Generando reporte: {filename}")
+    
+    # Obtener consultas sin expediente tipo 1 y 2
+    print("\n🔍 Buscando consultas sin expediente...")
+    resultado = mysql_db.execute(text("""
+        SELECT 
+            c.id,
+            c.tipo_consulta,
+            c.nombres,
+            c.apellidos,
+            c.nacimiento,
+            c.dpi,
+            c.hoja_emergencia,
+            c.fecha_consulta,
+            c.hora,
+            c.dx
+        FROM consultas c
+        WHERE c.tipo_consulta IN (1, 2)
+        AND (c.expediente IS NULL OR c.expediente = 0)
+        AND c.nombres IS NOT NULL
+        AND TRIM(c.nombres) != ''
+        AND c.apellidos IS NOT NULL
+        AND TRIM(c.apellidos) != ''
+        ORDER BY c.id
+    """))
+    
+    consultas = resultado.fetchall()
+    total = len(consultas)
+    
+    if total == 0:
+        print("✅ No hay consultas sin asociar")
+        return None
+    
+    print(f"✅ Encontradas {total:,} consultas sin asociar")
+    
+    # Escribir CSV
+    print(f"\n📝 Escribiendo archivo CSV...")
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Encabezados
+        writer.writerow([
+            'ID Consulta',
+            'Tipo Consulta',
+            'Nombres',
+            'Apellidos',
+            'Nacimiento',
+            'DPI',
+            'Hoja Emergencia',
+            'Fecha Consulta',
+            'Hora',
+            'Diagnóstico'
+        ])
+        
+        # Datos
+        for row in consultas:
+            writer.writerow([
+                row[0],  # id
+                row[1],  # tipo_consulta
+                row[2],  # nombres
+                row[3],  # apellidos
+                row[4],  # nacimiento
+                row[5],  # dpi
+                row[6],  # hoja_emergencia
+                row[7],  # fecha_consulta
+                row[8],  # hora
+                row[9]   # dx
+            ])
+    
+    print(f"✅ Archivo generado: {filename}")
+    print(f"   Total registros: {total:,}")
+    
+    # Mostrar muestra
+    print("\n📋 Muestra (primeras 10 consultas):")
+    print("-" * 80)
+    for i, row in enumerate(consultas[:10]):
+        print(f"{row[0]:8} | Tipo {row[1]} | {row[2][:20]:20} | {row[3][:20]:20}")
+    
+    if total > 10:
+        print(f"... y {total - 10:,} registros más")
+    
+    return filename
+
+# ============================================================================
+# GENERAR REPORTE CSV
+# ============================================================================
+
+def generar_reporte_no_asociadas():
+    """Genera CSV con consultas tipo 1 y 2 que no se pudieron asociar"""
+    
+    print("\n" + "=" * 80)
+    print("📄 GENERANDO REPORTE DE CONSULTAS NO ASOCIADAS")
+    print("=" * 80)
+    
+    import csv
+    
+    # Nombre del archivo
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"consultas_tipo12_no_asociadas_{timestamp}.csv"
+    
+    print(f"\n📄 Generando reporte: {filename}")
+    
+    # Obtener consultas sin expediente tipo 1 y 2
+    print("\n🔍 Buscando consultas sin expediente...")
+    resultado = mysql_db.execute(text("""
+        SELECT 
+            c.id,
+            c.tipo_consulta,
+            c.nombres,
+            c.apellidos,
+            c.nacimiento,
+            c.dpi,
+            c.hoja_emergencia,
+            c.fecha_consulta,
+            c.hora,
+            c.dx,
+            c.nota
+        FROM consultas c
+        WHERE c.tipo_consulta IN (1, 2)
+        AND (c.expediente IS NULL OR c.expediente = 0)
+        ORDER BY c.id
+    """))
+    
+    consultas = resultado.fetchall()
+    total = len(consultas)
+    
+    if total == 0:
+        print("✅ No hay consultas sin asociar")
+        return None
+    
+    print(f"✅ Encontradas {total:,} consultas sin asociar")
+    
+    # Clasificar por razón
+    sin_nombres = 0
+    sin_apellidos = 0
+    sin_ambos = 0
+    con_datos = 0
+    
+    for row in consultas:
+        nombres = row[2]
+        apellidos = row[3]
+        
+        if not nombres or str(nombres).strip() == '':
+            if not apellidos or str(apellidos).strip() == '':
+                sin_ambos += 1
+            else:
+                sin_nombres += 1
+        elif not apellidos or str(apellidos).strip() == '':
+            sin_apellidos += 1
+        else:
+            con_datos += 1
+    
+    print(f"\n   Clasificación:")
+    print(f"   - Sin nombres y apellidos:  {sin_ambos:,}")
+    print(f"   - Solo sin nombres:         {sin_nombres:,}")
+    print(f"   - Solo sin apellidos:       {sin_apellidos:,}")
+    print(f"   - Con nombres y apellidos:  {con_datos:,} (no encontrados en pacientes)")
+    
+    # Escribir CSV
+    print(f"\n📝 Escribiendo archivo CSV...")
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Encabezados
+        writer.writerow([
+            'ID Consulta',
+            'Tipo Consulta',
+            'Nombres',
+            'Apellidos',
+            'Nacimiento',
+            'DPI',
+            'Hoja Emergencia',
+            'Fecha Consulta',
+            'Hora',
+            'Diagnóstico',
+            'Notas',
+            'Razón No Asociada'
+        ])
+        
+        # Datos
+        for row in consultas:
+            nombres = row[2]
+            apellidos = row[3]
+            
+            # Determinar razón
+            if not nombres or str(nombres).strip() == '':
+                if not apellidos or str(apellidos).strip() == '':
+                    razon = "Sin nombres y apellidos"
+                else:
+                    razon = "Sin nombres"
+            elif not apellidos or str(apellidos).strip() == '':
+                razon = "Sin apellidos"
+            else:
+                razon = "No encontrado en tabla pacientes"
+            
+            writer.writerow([
+                row[0],   # id
+                row[1],   # tipo_consulta
+                row[2],   # nombres
+                row[3],   # apellidos
+                row[4],   # nacimiento
+                row[5],   # dpi
+                row[6],   # hoja_emergencia
+                row[7],   # fecha_consulta
+                row[8],   # hora
+                row[9],   # dx
+                row[10],  # nota
+                razon     # razón
+            ])
+    
+    print(f"✅ Archivo generado: {filename}")
+    print(f"   Total registros: {total:,}")
+    
+    # Mostrar muestra
+    print("\n📋 Muestra (primeras 10 consultas):")
+    print("\n{:8} | {:4} | {:20} | {:20} | {:30}".format(
+        "ID", "Tipo", "Nombres", "Apellidos", "Razón"
+    ))
+    print("-" * 105)
+    
+    for i, row in enumerate(consultas[:10]):
+        nombres = row[2]
+        apellidos = row[3]
+        
+        # Determinar razón
+        if not nombres or str(nombres).strip() == '':
+            if not apellidos or str(apellidos).strip() == '':
+                razon = "Sin nombres y apellidos"
+            else:
+                razon = "Sin nombres"
+        elif not apellidos or str(apellidos).strip() == '':
+            razon = "Sin apellidos"
+        else:
+            razon = "No encontrado"
+        
+        nom_display = str(nombres)[:20] if nombres else "NULL"
+        ape_display = str(apellidos)[:20] if apellidos else "NULL"
+        
+        print("{:8} | {:4} | {:20} | {:20} | {:30}".format(
+            row[0], row[1], nom_display, ape_display, razon
+        ))
+    
+    if total > 10:
+        print(f"\n... y {total - 10:,} registros más")
+    
+    return filename
+
+# ============================================================================
 # MOSTRAR EJEMPLOS
 # ============================================================================
 
@@ -366,7 +635,9 @@ def mostrar_ejemplos_asociados():
 
 def main():
     print("\n💡 Este script asocia expedientes a consultas tipo 1 y 2")
-    print("   Compara nombres y apellidos con la tabla pacientes")
+    print("   Compara con tabla pacientes:")
+    print("   - Nombres: coincidencia EXACTA")
+    print("   - Apellidos: coincidencia INICIAL (comienza con...)")
     print("   Solo actualiza MySQL (NO afecta PostgreSQL)")
     print()
     
@@ -401,6 +672,15 @@ def main():
         # Mostrar ejemplos
         if stats_asociacion["asociadas"] > 0:
             mostrar_ejemplos_asociados()
+        
+        # Generar reporte de no asociadas
+        if stats_asociacion["sin_coincidencia"] > 0 or stats_asociacion["multiples_coincidencias"] > 0:
+            print("\n💡 Generando reporte de consultas no asociadas...")
+            respuesta_csv = input("   ¿Desea generar reporte CSV? (s/n): ")
+            if respuesta_csv.lower() == 's':
+                filename_csv = generar_reporte_no_asociadas()
+                if filename_csv:
+                    print(f"\n✅ Reporte CSV generado: {filename_csv}")
         
         tiempo_total = (datetime.now() - inicio).total_seconds()
         
