@@ -1,0 +1,19 @@
+START TRANSACTION;
+
+UPDATE consultas
+SET 
+    nombres = 'Andrea Camila',
+    apellidos = 'Aleman Barrientos',
+    sexo = 'F',
+    expediente = 79319
+WHERE id IN (250, 791, 97497, 97559, 97956, 100537);
+
+SELECT id, nombres, apellidos, sexo, expediente
+FROM consultas
+WHERE id IN (250, 791, 97497, 97559, 97956, 100537);
+
+-- Si todo está correcto:
+COMMIT;
+
+-- Si algo no cuadra:
+-- ROLLBACK;
