@@ -2,15 +2,16 @@ START TRANSACTION;
 
 UPDATE consultas
 SET 
-    nombres = 'Bernabe',
-    apellidos = 'Nestor Tun',
-    sexo = 'M',
-    expediente = 42179
-WHERE id IN (9529, 117992, 120560, 120663);
+    nombres = 'Mariela',
+    apellidos = 'Socop Reyes',
+    sexo = 'F',
+    expediente = 73321,
+    dpi = 3096277610406
+WHERE id IN (5995, 111611, 111916, 112027);
 
-SELECT id, nombres, apellidos, sexo, expediente
+SELECT id, nombres, apellidos, sexo, expediente, nacimiento
 FROM consultas
-WHERE id IN (9529, 117992, 120560, 120663);
+WHERE id IN (5995, 111611, 111916, 112027);
 
 -- Si todo está correcto:
 COMMIT;
@@ -18,4 +19,40 @@ COMMIT;
 -- Si algo no cuadra:
 -- ROLLBACK;
 
+3096277610406
 
+UPDATE cons_nac
+SET colegiado = 17957
+WHERE colegiado = 17597;
+
+UPDATE cons_nac
+SET colegiado = 21734
+WHERE colegiado = 21374;
+
+UPDATE cons_nac
+SET colegiado = 23302
+WHERE colegiado = 29302;
+
+
+
+INSERT INTO pacientes (
+    expediente,
+    nombre,
+    apellido,
+    dpi,
+    sexo,
+    nacimiento,
+    direccion,
+    telefono,
+    estado
+) VALUES (
+    42408,
+    'Glendy Yessenia',
+    'Chipix Sirin',
+    3115849340410,
+    'F',
+    '2022-05-17',
+    'Aldea Chiquex Santa Apolonia Chimaltenango',
+    '46183997 53342270',
+    'v'
+);
