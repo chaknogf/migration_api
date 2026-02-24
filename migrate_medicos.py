@@ -184,16 +184,16 @@ def transformar_medico(row: Any) -> tuple[dict, list[str]]:
 def construir_url_mysql():
     return (
         f"mysql+pymysql://{os.getenv('MYSQL_USER', 'root')}:"
-        f"{os.getenv('MYSQL_PASSWORD', '')}@"
+        f"{os.getenv('MYSQL_PASSWORD', 'Prometeus.0')}@"
         f"{os.getenv('MYSQL_HOST', 'localhost')}:"
         f"{os.getenv('MYSQL_PORT', '3306')}/"
-        f"{os.getenv('MYSQL_DATABASE', 'hospital')}"
+        f"{os.getenv('MYSQL_DATABASE', 'test_api')}"
     )
 
 def construir_url_postgres():
     return (
         f"postgresql://{os.getenv('POSTGRES_USER', 'postgres')}:"
-        f"{os.getenv('POSTGRES_PASSWORD', '')}@"
+        f"{os.getenv('POSTGRES_PASSWORD', 'secreto123')}@"
         f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
         f"{os.getenv('POSTGRES_PORT', '5432')}/"
         f"{os.getenv('POSTGRES_DB', 'hospital')}"
