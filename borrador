@@ -2,16 +2,17 @@ START TRANSACTION;
 
 UPDATE consultas
 SET 
-    nombres = 'Mariela',
-    apellidos = 'Socop Reyes',
+    nombres = 'Angelina',
+    apellidos = 'Marroquín Cuscún de Marroquin',
     sexo = 'F',
-    expediente = 73321,
-    dpi = 3096277610406
-WHERE id IN (5995, 111611, 111916, 112027);
+    expediente = 79556,
+    dpi = 2050877600406
+WHERE id IN (717, 19382, 19568, 94940, 95339, 95500, 99598, 125479, 125550, 126790, 127155, 127238);
+
 
 SELECT id, nombres, apellidos, sexo, expediente, nacimiento
 FROM consultas
-WHERE id IN (5995, 111611, 111916, 112027);
+WHERE id IN (717, 19382, 19568, 94940, 95339, 95500, 99598, 125479, 125550, 126790, 127155, 127238);
 
 -- Si todo está correcto:
 COMMIT;
@@ -19,7 +20,7 @@ COMMIT;
 -- Si algo no cuadra:
 -- ROLLBACK;
 
-3096277610406
+
 
 UPDATE cons_nac
 SET colegiado = 17957
@@ -46,13 +47,13 @@ INSERT INTO pacientes (
     telefono,
     estado
 ) VALUES (
-    42408,
-    'Glendy Yessenia',
-    'Chipix Sirin',
-    3115849340410,
+    43029,
+    'Angelica',
+    'España Luc de Chipix',
+    1947870360402,
     'F',
-    '2022-05-17',
-    'Aldea Chiquex Santa Apolonia Chimaltenango',
-    '46183997 53342270',
+    '1985-10-02',
+    'Aldea Hacienda Maria, San Jose Poaquil',
+    '32621006',
     'v'
 );
