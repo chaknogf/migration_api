@@ -20,14 +20,6 @@ def json_safe(obj):
 # NORMALIZADORES BÁSICOS
 # ============================================================================
 
-# def normalizar_cui(cui: Optional[int]) -> Optional[int]:
-#     if not cui:
-#         return None
-#     cui_str = str(cui).strip()
-#     if len(cui_str) != 13 or not cui_str.isdigit():
-#         return None
-#     return int(cui_str)
-
 def normalizar_cui(cui: Optional[int], cuis_vistos: set[int]) -> Optional[int]:
     if not cui:
         return None
@@ -46,8 +38,10 @@ def normalizar_cui(cui: Optional[int], cuis_vistos: set[int]) -> Optional[int]:
 
 def normalizar_expediente(expediente: Optional[int], id_mysql: int) -> str:
     """
-    Si el expediente viene vacío o en 0, se genera uno sintético
-    claramente identificable y único.
+    Convierte el expediente MySQL al string que usará PostgreSQL.
+    - Si el expediente es válido (no None, no 0) → str(expediente)
+    - Si es None o 0 → expediente sintético único "X{id_mysql}"
+    Esto es consistente con validar_expediente_duplicado().
     """
     if expediente is None or expediente == 0:
         return f"X{id_mysql}"
@@ -334,10 +328,6 @@ def normalizar_nacionalidad(nacionalidad: Optional[int | str]) -> str:
 
 
 def normalizar_parto(parto: Optional[str]) -> Optional[str]:
-    """
-    Normaliza tipo de parto.
-    P = Parto vaginal, C = Cesárea
-    """
     if not parto:
         return None
     
@@ -351,9 +341,6 @@ def normalizar_parto(parto: Optional[str]) -> Optional[str]:
 
 
 def normalizar_si_no(valor: Optional[str]) -> Optional[str]:
-    """
-    Normaliza valores S/N (Sí/No)
-    """
     if not valor:
         return None
     
@@ -385,12 +372,7 @@ def construir_datos_extra_jsonb(
     extrahospitalario: Optional[str] = None,
     personaid: Optional[str] = None
 ) -> Dict[str, Any]:
-    """
-    Construye estructura DatosExtra según interfaz TypeScript.
-    Incluye demograficos, socioeconomicos, neonatales y defunción.
-    """
 
-    # Procesar defunción
     defuncion_fecha = None
     if fecha_defuncion:
         try:
@@ -406,7 +388,6 @@ def construir_datos_extra_jsonb(
         except:
             defuncion_fecha = None
 
-    # Estructura Demograficos
     demograficos = {
         "idioma": idioma,
         "pueblo": pueblo,
@@ -415,7 +396,6 @@ def construir_datos_extra_jsonb(
         "vecindad": None
     }
 
-    # Estructura Socioeconomicos
     socioeconomicos = {
         "estado_civil": estado_civil,
         "ocupacion": ocupacion,
@@ -425,7 +405,6 @@ def construir_datos_extra_jsonb(
         "discapacidad": None
     }
 
-    # Estructura Neonatales (solo si hay datos relevantes)
     neonatales = None
     if any([peso_nacimiento, edad_gestacional, parto, gemelo, expediente_madre, extrahospitalario]):
         neonatales = {
@@ -437,7 +416,6 @@ def construir_datos_extra_jsonb(
             "extrahositalario": normalizar_si_no(extrahospitalario)
         }
 
-    # Construir respuesta final
     resultado = {
         "defuncion": defuncion_fecha,
         "personaid": personaid,
@@ -445,7 +423,6 @@ def construir_datos_extra_jsonb(
         "socioeconomicos": socioeconomicos
     }
 
-    # Solo incluir neonatales si hay datos
     if neonatales:
         resultado["neonatales"] = neonatales
 
@@ -462,7 +439,7 @@ def construir_metadatos_jsonb(
         {
             "accion": "CREADO",
             "usuario": created_by,
-            "registro": created_at or datetime.now().isoformat(),
+            "registro": created_at ,
             "expediente_duplicado": expediente_duplicado,
             "origen_mysql_id": id_mysql
         }

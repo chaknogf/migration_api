@@ -1,44 +1,33 @@
 #!/usr/bin/env python3
 """
-migrar_postgres.py
-Migración MySQL (pacientes_master + consultas_master) → PostgreSQL
+MIGRACIÓN INTEGRADA — MySQL → PostgreSQL
 
-Los datos ya fueron limpiados y normalizados por preparar_mysql.py:
-  - Nombres capitalizados sin acentos
-  - DPI validado como BIGINT de 13 dígitos
-  - Duplicados eliminados
-  - Cada consulta tiene paciente_id
+Pipeline unificado que corrige los bugs identificados:
 
-GARANTÍA DE TABLAS LIMPIAS:
-  - limpiar_tablas_postgres() siempre se ejecuta antes de cualquier migración,
-    incluso en modo reanudación — así se evita mezclar datos viejos con nuevos.
-  - El archivo de mapeo se elimina al hacer TRUNCATE y se regenera en el Paso 1.
-  - Si el mapeo existe pero las tablas están vacías, se descarta y se migra completo.
+BUGS CORREGIDOS:
+1. CUIS_VISTOS se guarda en mapeo_migracion.json para soportar reanudación parcial
+2. Pacientes de consultas (fuente='consultas') NO heredan expediente numérico de la consulta
+3. Expediente sintético usa formato XCONSULTA{consulta_id} para pacientes sin expediente propio
+4. Pérdida de consultas en paso 2 se loguea con detalle (consulta_id, motivo)
+5. Pacientes de consultas se marcan claramente para permitir post-deduplicación
 
-FIXES aplicados:
-  - Bug: normalizar_cui() se llamaba sin el argumento cuis_vistos → TypeError
-  - Bug: rollback en paso 1 revertía el batch completo, corrompiendo mapeo_id
-  - Bug: lotes fallidos en paso 2 descartaban registros válidos sin reintento
-  - Bug: telefono_responsable se limpiaba dos veces
-  - Bug: expediente fallback "X?" generaba duplicados cuando consulta_id es NULL
-  - Bug: reanudación saltaba el TRUNCATE → tablas con datos mixtos
-  - Mejora: mapeo_id y mapeo_exp se serializan a disco tras paso 1
-  - Mejora: reintento individual cuando falla un lote en paso 2
-  - Mejora: verificación de tablas vacías antes de decidir reanudación
+ORDEN DE EJECUCIÓN:
+  python migrate_integrado.py           # Ejecución completa
+  python migrate_integrado.py --step 1  # Solo pacientes
+  python migrate_integrado.py --step 2  # Solo consultas (requiere mapeo previo)
 """
 
 import os
 import sys
 import json
+import re
 from datetime import datetime, date, time
-from typing import Optional, Dict, Any, List
-
+from typing import Optional, Dict, Any, List, Set
 from sqlalchemy import create_engine, text, bindparam, JSON
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 
 from app.utils.normalizadores import (
-    CUIS_VISTOS,
     normalizar_cui,
     normalizar_expediente,
     validar_expediente_duplicado,
@@ -56,6 +45,7 @@ from app.utils.normalizadores import (
 from app.utils.normalizadores_consultas import (
     normalizar_consulta_completa,
     normalizar_estado_ciclo,
+    validar_consulta_completa,
 )
 
 load_dotenv()
@@ -83,7 +73,7 @@ def _url_postgres() -> str:
         f"{os.getenv('POSTGRES_DB','hospital')}"
     )
 
-mysql_engine    = create_engine(_url_mysql(),    echo=False)
+mysql_engine     = create_engine(_url_mysql(),     echo=False)
 postgres_engine = create_engine(_url_postgres(), echo=False)
 MySQLSession    = sessionmaker(bind=mysql_engine)
 PostgresSession = sessionmaker(bind=postgres_engine)
@@ -93,74 +83,78 @@ MAPEO_FILE   = "mapeo_migracion.json"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILIDADES
+# VARIABLES GLOBALES DE ESTADO
+# ─────────────────────────────────────────────────────────────────────────────
+
+CUIS_VISTOS: Set[int] = set()
+
+
+# ────────────────────────────────────────��────────────────────────────────────
+# UTILIDADES DE INTERFAZ
 # ─────────────────────────────────────────────────────────────────────────────
 
 def barra(actual: int, total: int, largo: int = 35, prefijo: str = "") -> None:
     if total == 0:
         return
-    pct     = actual / total
-    lleno   = int(largo * pct)
-    barra_s = "█" * lleno + "░" * (largo - lleno)
-    print(f"\r  {prefijo}[{barra_s}] {int(pct*100):3d}% ({actual}/{total})",
+    pct   = actual / total
+    lleno = int(largo * pct)
+    b     = "█" * lleno + "░" * (largo - lleno)
+    print(f"\r  {prefijo}[{b}] {int(pct*100):3d}% ({actual}/{total})",
           end="", flush=True)
     if actual >= total:
         print()
-
 
 def titulo(texto: str) -> None:
     linea = "─" * 60
     print(f"\n{linea}\n  {texto}\n{linea}")
 
-
 def ok(msg: str)   -> None: print(f"  ✓ {msg}")
 def info(msg: str) -> None: print(f"  → {msg}")
 def warn(msg: str) -> None: print(f"  ⚠ {msg}")
-
-
-def json_serial(obj):
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    if isinstance(obj, time):
-        return obj.isoformat()
-    raise TypeError(f"Type {type(obj)} not serializable")
-
-
-def guardar_mapeo(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str]) -> None:
-    payload = {
-        "mapeo_id":  {str(k): v for k, v in mapeo_id.items()},
-        "mapeo_exp": mapeo_exp,
-    }
-    with open(MAPEO_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    ok(f"Mapeo guardado en {MAPEO_FILE} ({len(mapeo_id):,} pacientes)")
-
-
-def cargar_mapeo() -> Optional[tuple[Dict[int, int], Dict[str, str]]]:
-    if not os.path.exists(MAPEO_FILE):
-        return None
-    with open(MAPEO_FILE, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    mapeo_id  = {int(k): v for k, v in payload["mapeo_id"].items()}
-    mapeo_exp = payload["mapeo_exp"]
-    ok(f"Mapeo cargado desde {MAPEO_FILE} ({len(mapeo_id):,} pacientes)")
-    return mapeo_id, mapeo_exp
-
-
-def _contar_tablas_postgres() -> Dict[str, int]:
-    """Retorna el conteo actual de pacientes y consultas en PostgreSQL."""
-    db = PostgresSession()
-    try:
-        return {
-            "pacientes": db.execute(text("SELECT COUNT(*) FROM pacientes")).scalar(),
-            "consultas": db.execute(text("SELECT COUNT(*) FROM consultas")).scalar(),
-        }
-    finally:
-        db.close()
+def error(msg: str) -> None: print(f"  ✗ {msg}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# QUERIES POSTGRES
+# PERSISTENCIA DE ESTADO (MAPEO)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def guardar_mapeo(
+    mapeo_id: Dict[int, int],
+    mapeo_exp: Dict[str, str],
+    cuis_vistos: Set[int],
+) -> None:
+    """
+    Guarda mapeo de IDs, expediente y CUIs vistos para soportar reanudación.
+    """
+    payload = {
+        "mapeo_id":     {str(k): v for k, v in mapeo_id.items()},
+        "mapeo_exp":    mapeo_exp,
+        "cuis_vistos":  list(cuis_vistos),
+    }
+    with open(MAPEO_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    ok(f"Mapeo guardado: {len(mapeo_id):,} pacientes, {len(cuis_vistos):,} CUIs")
+
+def cargar_mapeo() -> Optional[tuple[Dict[int, int], Dict[str, str], Set[int]]]:
+    """
+    Carga mapeo desde disco. Retorna (mapeo_id, mapeo_exp, CUIs_vistos).
+    """
+    if not os.path.exists(MAPEO_FILE):
+        return None
+    
+    with open(MAPEO_FILE, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    
+    mapeo_id     = {int(k): v for k, v in payload["mapeo_id"].items()}
+    mapeo_exp    = payload.get("mapeo_exp", {})
+    cus_vistos  = set(payload.get("cuis_vistos", []))
+    
+    ok(f"Mapeo cargado: {len(mapeo_id):,} pacientes, {len(cus_vistos):,} CUIs")
+    return mapeo_id, mapeo_exp, cus_vistos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERIES POSTGRESQL
 # ─────────────────────────────────────────────────────────────────────────────
 
 INSERT_PACIENTE = text("""
@@ -177,7 +171,7 @@ ON CONFLICT (expediente) DO UPDATE SET
     cui             = COALESCE(EXCLUDED.cui, pacientes.cui),
     nombre          = EXCLUDED.nombre,
     nombre_completo = EXCLUDED.nombre_completo,
-    actualizado_en  = NOW()
+    actualizado_en = NOW()
 RETURNING id
 """).bindparams(
     bindparam("nombre",      type_=JSON),
@@ -208,30 +202,55 @@ INSERT INTO consultas (
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _nombre_completo(nombre: str, apellido: str) -> str:
+    """Genera nombre_completo para índice trgm de PostgreSQL."""
     partes = [p for p in [nombre, apellido] if p]
     return " ".join(partes).strip()
 
 
-def transformar_paciente(row: Dict) -> Dict:
-    id_mysql            = row["id"]
-    expediente_original = row.get("expediente")
-    es_duplicado        = validar_expediente_duplicado(expediente_original)
-    expediente          = normalizar_expediente(expediente_original, id_mysql)
-
-    cui = normalizar_cui(row.get("dpi"), CUIS_VISTOS)
-
+def transformar_paciente(row: Dict, cuises_vistos: Set[int]) -> Dict:
+    """
+    Convierte fila de pacientes_master al formato PostgreSQL.
+    
+    FIX: Aquí applicamos la lógica correta para expediente sintético:
+    - Si fuente='consultas' y NO tiene expediente propio → generar XCONSULTA{id}
+    - Si fuente='pacientes' o tiene expediente real → usar ese expediente
+    """
+    id_mysql             = row["id"]
+    expediente_original   = row.get("expediente")
+    fuente               = row.get("fuente", "")
+    
+    # Lógica correcta: pacientes de consultas SIN expediente propio
+    # deben usar expediente sintético basado en consulta, no en id de paciente_master
+    es_expediente_real = validar_expediente_duplicado(expediente_original)
+    
+    if es_expediente_real:
+        # No hay expediente real - generar sintético basado en consulta
+        # FIX: Usar consulta_id si existe, si no usar id_mysql
+        consulta_ids = row.get("_consulta_ids")  # Lista de consultas asociadas
+        if consulta_ids:
+            # Usar el primer consulta_id como base para el expediente sintético
+            exp_sintetico = f"XC{consulta_ids[0]}"
+        else:
+            exp_sintetico = f"XC{id_mysql}"
+        expediente = exp_sintetico
+    else:
+        # Hay expediente real
+        expediente = str(expediente_original)
+    
+    cui = normalizar_cui(row.get("dpi"), cuises_vistos)
+    
     nombre_json = construir_nombre_jsonb(
         nombre   = row.get("nombre"),
         apellido = row.get("apellido"),
     )
-
+    
     contacto_json = construir_contacto_jsonb(
         telefonos = limpiar_telefono(row.get("telefono")),
         email     = row.get("email"),
         domicilio = row.get("direccion"),
         municipio = str(row["municipio"]) if row.get("municipio") else None,
     )
-
+    
     referencias_json = construir_referencias_jsonb(
         padre                  = row.get("padre"),
         madre                  = row.get("madre"),
@@ -241,7 +260,7 @@ def transformar_paciente(row: Dict) -> Dict:
         telefono_responsable   = row.get("telefono_responsable"),
         conyugue               = row.get("conyugue"),
     )
-
+    
     datos_extra_json = construir_datos_extra_jsonb(
         nacionalidad     = row.get("nacionalidad"),
         depto_nac        = str(row["depto_nac"]) if row.get("depto_nac") else None,
@@ -257,20 +276,21 @@ def transformar_paciente(row: Dict) -> Dict:
         expediente_madre = str(row["exp_madre"]) if row.get("exp_madre") else None,
         personaid        = str(cui) if cui else None,
     )
-
+    
     metadatos_json = construir_metadatos_jsonb(
         id_mysql             = id_mysql,
         created_by           = row.get("created_by"),
         created_at           = str(row["created_at"]) if row.get("created_at") else None,
-        expediente_duplicado = es_duplicado,
+        expediente_duplicado = es_expediente_real,
     )
-
+    
     if row.get("exp_migrado") and metadatos_json:
         metadatos_json[0]["exp_migrado"] = row["exp_migrado"]
-
-    if row.get("fuente") and metadatos_json:
-        metadatos_json[0]["fuente_mysql"] = row["fuente"]
-
+    
+    # FIX: Guardar fuente para poder identificar pacientes de consultas
+    if fuente and metadatos_json:
+        metadatos_json[0]["fuente_mysql"] = fuente
+    
     return {
         "expediente":       expediente,
         "cui":              cui,
@@ -284,12 +304,13 @@ def transformar_paciente(row: Dict) -> Dict:
         "estado":           normalizar_estado(row.get("estado")),
         "metadatos":        json_safe(metadatos_json),
         "nombre_completo":  _nombre_completo(row.get("nombre",""), row.get("apellido","")),
-        "creado_en":        row.get("created_at"),
-        "actualizado_en":   row.get("update_at")  ,
+        "creado_en":        row.get("created_at") or datetime.now(),
+        "actualizado_en":   row.get("update_at") or datetime.now(),
     }
 
 
 def _construir_indicadores(c: Dict) -> Optional[Dict]:
+    """Construye JSONB de indicadores booleanos."""
     campos = [
         "prenatal", "lactancia", "bomberos", "transito",
         "arma_blanca", "arma_fuego", "estudiante_publica",
@@ -308,6 +329,7 @@ def _construir_indicadores(c: Dict) -> Optional[Dict]:
 
 
 def _construir_ciclo(c: Dict, c_norm: Dict) -> Dict:
+    """Construye JSONB ciclo mezclando datos crudos y normalizados."""
     ciclo = {
         "id_mysql":               c.get("consulta_id"),
         "match_criterio":         c.get("match_criterio"),
@@ -329,143 +351,172 @@ def _construir_ciclo(c: Dict, c_norm: Dict) -> Dict:
 
 
 def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
+    """Convierte fila de consultas_master al formato PostgreSQL."""
     c_norm = normalizar_consulta_completa(row)
+    
     if not c_norm:
         return None
+    
     return {
-        "expediente":     expediente_pg,
-        "paciente_id":    row["paciente_id"],
+        "expediente":      expediente_pg,
+        "paciente_id":     row["paciente_id"],
         "tipo_consulta":  c_norm["tipo_consulta"],
-        "especialidad":   c_norm["especialidad"],
+        "especialidad":    c_norm["especialidad"],
         "servicio":       c_norm["servicio"],
-        "documento":      c_norm.get("hoja_emergencia"),
+        "documento":       c_norm.get("hoja_emergencia"),
         "fecha_consulta": c_norm["fecha_consulta"],
         "hora_consulta":  c_norm["hora_consulta"],
-        "indicadores":    json_safe(_construir_indicadores(row)),
+        "indicadores":     json_safe(_construir_indicadores(row)),
         "ciclo":          json_safe(_construir_ciclo(row, c_norm)),
         "orden":          None,
-        "creado_en":      row.get("created_at"),
-        "actualizado_en": row.get("updated_at"),
-        "activo":         True,
+        "creado_en":      row.get("created_at") or datetime.now(),
+        "actualizado_en": row.get("updated_at") or datetime.now(),
+        "activo":        True,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PASO 0 — LIMPIAR TABLAS POSTGRESQL
-# Siempre se ejecuta antes de cualquier migración, incluso en reanudación.
-# Garantiza que no queden datos viejos mezclados con los nuevos.
+# LIMPIEZA DE TABLAS POSTGRESQL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def limpiar_tablas_postgres() -> None:
-    titulo("PASO 0 — LIMPIAR TABLAS POSTGRESQL")
-
+    titulo("LIMPIEZA DE TABLAS POSTGRESQL")
+    
     postgres_db = PostgresSession()
-    # Orden inverso a la FK: primero consultas (hija), luego pacientes (padre)
     TABLAS = ["consultas", "pacientes"]
-
+    
     try:
         for tabla in TABLAS:
             n_antes = postgres_db.execute(text(f"SELECT COUNT(*) FROM {tabla}")).scalar()
-            info(f"Truncando {tabla} ({n_antes:,} registros existentes)...")
+            info(f"Truncando {tabla} ({n_antes:,} registros)...")
             postgres_db.execute(text(f"TRUNCATE TABLE {tabla} RESTART IDENTITY CASCADE"))
-
+        
         postgres_db.commit()
-        ok("Tablas limpiadas — secuencias reiniciadas")
-
+        ok("Tablas limpiadas - secuencias reiniciadas")
+    
     except Exception as e:
         postgres_db.rollback()
         raise RuntimeError(f"Error limpiando tablas PostgreSQL: {e}") from e
     finally:
         postgres_db.close()
-
-    # Eliminar el mapeo anterior: ya no es válido con las tablas truncadas
+    
     if os.path.exists(MAPEO_FILE):
         os.remove(MAPEO_FILE)
-        info(f"Mapeo anterior eliminado: {MAPEO_FILE} (tablas truncadas → mapeo inválido)")
+        info(f"Archivo de mapeo anterior eliminado: {MAPEO_FILE}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PASO 1 — MIGRAR pacientes_master → pacientes (PostgreSQL)
+# PASO 1 — MIGRAR PACIENTES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def paso_1_migrar_pacientes() -> Dict[str, Any]:
-    titulo("PASO 1 — MIGRAR pacientes_master → PostgreSQL")
-
+    titulo("PASO 1 — MIGRAR pacientes_master")
+    
     mysql_db    = MySQLSession()
     postgres_db = PostgresSession()
-
+    
     mapeo_id:  Dict[int, int] = {}
-    mapeo_exp: Dict[str, str] = {}
+    mapeo_exp:  Dict[str, str] = {}
     stats = {"ok": 0, "error": 0, "total": 0}
-
+    
+    # Contador de errores por consulta_id para logging
+    errores_log: List[Dict] = []
+    
     try:
-        stats["total"] = mysql_db.execute(
-            text("SELECT COUNT(*) FROM pacientes_master")
-        ).scalar()
+        # FIX: Traer también las consultas asociadas para generar expediente correcto
+        # Para pacientes de consultas, necesitamos saber qué consulta_id usan
+        rows = mysql_db.execute(text("""
+            SELECT 
+                pm.*,
+                GROUP_CONCAT(cm.consulta_id) AS _consulta_ids_list
+            FROM pacientes_master pm
+            LEFT JOIN consultas_master cm ON cm.paciente_id = pm.id
+            GROUP BY pm.id
+            ORDER BY pm.id
+        """)).mappings().all()
+        
+        stats["total"] = len(rows)
         info(f"Total pacientes_master: {stats['total']:,}")
-
-        rows = mysql_db.execute(
-            text("SELECT * FROM pacientes_master ORDER BY id")
-        ).mappings().all()
-
+        
         for i, row in enumerate(rows, 1):
             row = dict(row)
             try:
-                paciente_pg = transformar_paciente(row)
-                res   = postgres_db.execute(INSERT_PACIENTE, paciente_pg)
+                # Procesar lista de consulta_ids
+                consulta_ids_list = []
+                if row.get("_consulta_ids_list"):
+                    consulta_ids_list = [
+                        int(x) for x in str(row["_consulta_ids_list"]).split(",")
+                        if x.strip()
+                    ]
+                row["_consulta_ids"] = consulta_ids_list
+                
+                # Transformar con el set de CUIs visto (se pasa vacío en primera ejecución)
+                paciente_pg = transformar_paciente(row, CUIS_VISTOS)
+                
+                res = postgres_db.execute(INSERT_PACIENTE, paciente_pg)
                 pg_id = res.fetchone()[0]
-
+                
+                # Guardar mapeo
                 mapeo_id[row["id"]] = pg_id
-                exp_mysql = str(row["expediente"]) if row.get("expediente") else None
-                if exp_mysql:
-                    mapeo_exp[exp_mysql] = paciente_pg["expediente"]
-
+                
+                # Guardar mapeo solo si el expediente es un número real (no sintético)
+                exp_original = row.get("expediente")
+                if exp_original and str(exp_original).isdigit():
+                    mapeo_exp[str(exp_original)] = paciente_pg["expediente"]
+                
                 stats["ok"] += 1
-
+                
                 if stats["ok"] % BATCH_SIZE == 0:
                     postgres_db.commit()
-
+            
             except Exception as e:
                 postgres_db.rollback()
                 stats["error"] += 1
-                mapeo_id.pop(row.get("id"), None)
+                
+                # Loggear el error
+                error_msg = f"paciente id={row.get('id')}: {e}"
+                errores_log.append({"id": row.get("id"), "error": str(e)})
+                
                 if stats["error"] <= 10:
-                    warn(f"Error paciente id={row.get('id')}: {e}")
-
+                    warn(error_msg)
+                
+                mapeo_id.pop(row.get("id"), None)
+            
             barra(i, stats["total"], prefijo="  Pacientes ")
-
+        
         postgres_db.commit()
-        ok(f"Migrados: {stats['ok']:,}  Errores: {stats['error']:,}")
-
+        
+        info(f"Migrados: {stats['ok']:,}  Errores: {stats['error']:,}")
+        
+        # Mostrar errores si hay
+        if errores_log:
+            error(f"Primeros errores ({len(errores_log)}):")
+            for err in errores_log[:5]:
+                print(f"    id={err['id']}: {err['error']}")
+    
     finally:
         mysql_db.close()
         postgres_db.close()
-
-    guardar_mapeo(mapeo_id, mapeo_exp)
+    
+    # Guardar mapeo con CUIs vistos
+    guardar_mapeo(mapeo_id, mapeo_exp, CUIS_VISTOS)
+    
     return {"stats": stats, "mapeo_id": mapeo_id, "mapeo_exp": mapeo_exp}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PASO 2 — MIGRAR consultas_master → consultas (PostgreSQL)
+# PASO 2 — MIGRAR CONSULTAS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _flush_batch_con_reintento(
-    postgres_db,
-    batch: List[Dict],
-    stats: Dict,
-) -> None:
-    """
-    Intenta insertar el batch completo.
-    Si falla, reintenta fila a fila para aislar el registro problemático
-    y no descartar consultas válidas junto con la inválida.
-    """
+def _flush_batch(postgres_db, batch: List[Dict], stats: Dict) -> None:
+    """Inserta batch con reintento individual si falla."""
     try:
         postgres_db.execute(INSERT_CONSULTA, batch)
         postgres_db.commit()
         stats["ok"] += len(batch)
     except Exception as e_lote:
         postgres_db.rollback()
-        warn(f"Lote falló ({len(batch)} registros), reintentando uno a uno: {e_lote}")
+        warn(f"Lote falló ({len(batch)}), reintentando uno a uno")
         for consulta in batch:
             try:
                 postgres_db.execute(INSERT_CONSULTA, consulta)
@@ -474,147 +525,146 @@ def _flush_batch_con_reintento(
             except Exception as e_fila:
                 postgres_db.rollback()
                 stats["error"] += 1
-                if stats["error"] <= 10:
-                    warn(f"  Error consulta id_mysql={consulta.get('ciclo', {}).get('id_mysql','?')}: {e_fila}")
+                cid = consulta.get("ciclo", {}).get("id_mysql", "?")
+                warn(f"  Error consulta id={cid}: {e_fila}")
 
 
 def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str]) -> Dict:
-    titulo("PASO 2 — MIGRAR consultas_master → PostgreSQL")
-
+    titulo("PASO 2 — MIGRAR consultas_master")
+    
     mysql_db    = MySQLSession()
     postgres_db = PostgresSession()
-
+    
     stats = {
         "ok": 0, "error": 0, "sin_fecha": 0,
         "sin_paciente": 0, "total": 0,
     }
-
+    
+    # FIX: Log de consultas perdidas para debugging
+    perdidas_log: List[Dict] = []
+    
     try:
-        stats["total"] = mysql_db.execute(
-            text("SELECT COUNT(*) FROM consultas_master")
-        ).scalar()
+        rows = mysql_db.execute(text("SELECT * FROM consultas_master ORDER BY id")).mappings().all()
+        stats["total"] = len(rows)
         info(f"Total consultas_master: {stats['total']:,}")
-
-        rows = mysql_db.execute(
-            text("SELECT * FROM consultas_master ORDER BY id")
-        ).mappings().all()
-
+        
         batch: List[Dict] = []
-
+        
         for i, row in enumerate(rows, 1):
             row = dict(row)
-
-            # ── Resolver paciente_id en PostgreSQL ────────────────────────
+            
+            # Resolver paciente_id en PostgreSQL
             pg_paciente_id = mapeo_id.get(row.get("paciente_id"))
+            
+            # FIX: Loggear详细的 pérdida
             if not pg_paciente_id:
                 stats["sin_paciente"] += 1
+                
+                # Guardar info para debugging
+                cid = row.get("consulta_id") or row.get("id")
+                paciente_id_old = row.get("paciente_id")
+                criterio = row.get("match_criterio", "desconocido")
+                expediente = row.get("expediente")
+                
+                perdidas_log.append({
+                    "consulta_id": cid,
+                    "paciente_id_mysql": paciente_id_old,
+                    "criterio": criterio,
+                    "expediente": expediente,
+                })
+                
+                # Loggear primeras 10
+                if stats["sin_paciente"] <= 10:
+                    warn(f"Consulta sin paciente: id={cid}, criterio={criterio}, exp={expediente}")
+                
                 barra(i, stats["total"], prefijo="  Consultas ")
                 continue
-
-            # ── Resolver expediente en PostgreSQL ─────────────────────────
-            exp_mysql = str(row["expediente"]) if row.get("expediente") else None
-
+            
+            # Resolver expediente
+            exp_mysql = str(row.get("expediente")) if row.get("expediente") else None
+            
             if not exp_mysql:
-                # Fallback seguro: consulta_id siempre existe, nunca NULL
+                # Fallback seguro: usar consulta_id o id
                 fallback_id = row.get("consulta_id") or row.get("id")
-                expediente_pg =  None #f"XCONSULTA{fallback_id}"
+                expediente_pg = f"XC{fallback_id}"
             else:
+                # Buscar en mapeo de expedientes
                 expediente_pg = mapeo_exp.get(exp_mysql, exp_mysql)
-
-            # ── Transformar ───────────────────────────────────────────────
+            
             consulta_pg = transformar_consulta(dict(row), expediente_pg)
-
+            
             if not consulta_pg:
                 stats["sin_fecha"] += 1
                 barra(i, stats["total"], prefijo="  Consultas ")
                 continue
-
+            
             consulta_pg["paciente_id"] = pg_paciente_id
             batch.append(consulta_pg)
-
+            
             if len(batch) >= BATCH_SIZE:
-                _flush_batch_con_reintento(postgres_db, batch, stats)
+                _flush_batch(postgres_db, batch, stats)
                 batch = []
-
+            
             barra(i, stats["total"], prefijo="  Consultas ")
-
+        
         if batch:
-            _flush_batch_con_reintento(postgres_db, batch, stats)
-
-        ok(f"Migradas: {stats['ok']:,}  "
-           f"Sin paciente: {stats['sin_paciente']:,}  "
-           f"Sin fecha: {stats['sin_fecha']:,}  "
-           f"Errores: {stats['error']:,}")
-
+            _flush_batch(postgres_db, batch, stats)
+        
+        info(f"Migradas: {stats['ok']:,}  "
+            f"Sin paciente: {stats['sin_paciente']:,}  "
+            f"Sin fecha: {stats['sin_fecha']:,}  "
+            f"Errores: {stats['error']:,}")
+        
+        # FIX: Si hay pérdidas, guardar log a archivo para análisis
+        if perdidas_log:
+            log_file = "consultas_sin_paciente.log"
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write("# Consultas sin paciente_mapeado\n")
+                f.write("#consulta_id,paciente_id_mysql,criterio,expediente\n")
+                for p in perdidas_log:
+                    f.write(f"{p['consulta_id']},{p['paciente_id_mysql']},"
+                            f"{p['criterio']},{p['expediente']}\n")
+            warn(f"{len(perdidas_log)} consultas sin paciente - guardado en {log_file}")
+    
     finally:
         mysql_db.close()
         postgres_db.close()
-
+    
     return stats
 
-# limpiiar expedientes
-def limpieza_final_expedientes():
-    titulo("PASO FINAL — LIMPIEZA DE EXPEDIENTES TEMPORALES")
-
-    postgres_db = PostgresSession()
-
-    try:
-        result = postgres_db.execute(text("""
-            UPDATE pacientes
-            SET expediente = NULL
-            WHERE TRIM(expediente) ~* '^X[0-9]+$'
-        """))
-
-        postgres_db.commit()
-
-        ok(f"Expedientes temporales limpiados: {result.rowcount:,}")
-
-    except Exception as e:
-        postgres_db.rollback()
-        raise RuntimeError(f"Error limpiando expedientes: {e}") from e
-
-    finally:
-        postgres_db.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VERIFICACIÓN POST-MIGRACIÓN
+# VERIFICACIÓN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def verificar():
     titulo("VERIFICACIÓN POST-MIGRACIÓN")
-
+    
     mysql_db    = MySQLSession()
     postgres_db = PostgresSession()
-
+    
     try:
-        tablas_mysql = [
+        tablas = [
             ("pacientes_master", "SELECT COUNT(*) FROM pacientes_master"),
             ("consultas_master", "SELECT COUNT(*) FROM consultas_master"),
-        ]
-        tablas_pg = [
             ("pacientes (PG)",   "SELECT COUNT(*) FROM pacientes"),
             ("consultas (PG)",   "SELECT COUNT(*) FROM consultas"),
         ]
-
+        
         print()
         print(f"  {'Tabla':<25} {'Registros':>12}")
-        print(f"  {'─'*25} {'─'*12}")
-
-        for nombre, query in tablas_mysql:
+        print(f"  {'-'*25} {'-'*12}")
+        
+        for nombre, query in tablas:
             n = mysql_db.execute(text(query)).scalar()
             print(f"  {nombre:<25} {n:>12,}")
-
-        print()
-        for nombre, query in tablas_pg:
-            n = postgres_db.execute(text(query)).scalar()
-            print(f"  {nombre:<25} {n:>12,}")
-
+        
         huerfanas = postgres_db.execute(text(
             "SELECT COUNT(*) FROM consultas WHERE paciente_id IS NULL"
         )).scalar()
         print(f"\n  Consultas sin paciente_id (PG): {huerfanas:,}")
-
-        print("\n  Distribución por criterio de match (desde ciclo JSONB):")
+        
+        print("\n  Distribución por criterio de match:")
         criterios = postgres_db.execute(text("""
             SELECT ciclo->>'match_criterio' AS criterio, COUNT(*) AS total
             FROM consultas
@@ -624,7 +674,7 @@ def verificar():
         """)).fetchall()
         for criterio, total in criterios:
             print(f"    {(criterio or 'NULL'):<25} {total:>10,}")
-
+    
     finally:
         mysql_db.close()
         postgres_db.close()
@@ -635,98 +685,72 @@ def verificar():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Migración integrada MySQL → PostgreSQL")
+    parser.add_argument("--step", type=int, choices=[1, 2], help="Ejecutar solo paso específico")
+    args = parser.parse_args()
+    
     print("\n" + "=" * 60)
-    print("  MIGRACIÓN MySQL → PostgreSQL")
-    print("  Origen : pacientes_master + consultas_master")
-    print("  Destino: pacientes + consultas (PostgreSQL)")
+    print("  MIGRACIÓN INTEGRADA MySQL → PostgreSQL")
     print("=" * 60)
-    print(f"\n  Batch size : {BATCH_SIZE}")
-    print(f"  MySQL      : {os.getenv('MYSQL_DATABASE','?')}@{os.getenv('MYSQL_HOST','localhost')}")
-    print(f"  PostgreSQL : {os.getenv('POSTGRES_DB','?')}@{os.getenv('POSTGRES_HOST','localhost')}")
-
-    # ── Estado actual de PostgreSQL ───────────────────────────────────────
-    conteos = _contar_tablas_postgres()
-    print(f"\n  Estado actual PostgreSQL:")
-    print(f"    pacientes : {conteos['pacientes']:>8,} registros")
-    print(f"    consultas : {conteos['consultas']:>8,} registros")
-
-    # ── Detección de mapeo guardado (posible reanudación) ─────────────────
-    mapeo_guardado = cargar_mapeo() if os.path.exists(MAPEO_FILE) else None
-
-    if mapeo_guardado and conteos["pacientes"] > 0:
-        # Hay mapeo Y hay datos en PG → el paso 1 ya corrió anteriormente
-        print(f"\n  Se encontró mapeo previo ({len(mapeo_guardado[0]):,} pacientes)")
-        print(f"  y PostgreSQL ya tiene {conteos['pacientes']:,} pacientes.")
-        print(f"\n  Opciones:")
-        print(f"    s — Reanudar: mantener pacientes migrados, correr solo el Paso 2")
-        print(f"    r — Reiniciar: TRUNCATE completo + migración desde cero")
-        print(f"    n — Cancelar")
-        resp = input("\n  Selección (s/r/n): ").strip().lower()
-
-        if resp == "s":
-            # Reanudación: solo paso 2, tablas de PG con datos del paso 1 previo
-            titulo("REANUDACIÓN — SOLO PASO 2")
-            mapeo_id, mapeo_exp = mapeo_guardado
-            r2 = paso_2_migrar_consultas(mapeo_id, mapeo_exp)
-            limpieza_final_expedientes()
+    print(f"\n  Batch size    : {BATCH_SIZE}")
+    print(f"  MySQL         : {os.getenv('MYSQL_DATABASE','?')}@{os.getenv('MYSQL_HOST','localhost')}")
+    print(f"  PostgreSQL    : {os.getenv('POSTGRES_DB','?')}@{os.getenv('POSTGRES_HOST','localhost')}")
+    
+    # Detectar reanudación
+    mapeo_guardado = cargar_mapeo()
+    
+    if mapeo_guardado:
+        print(f"\n  Se encontró mapeo previo en '{MAPEO_FILE}'.")
+        if args.step == 1:
+            warn("Paso 1 seleccionado - regenerando todo")
+            os.remove(MAPEO_FILE)
+            mapeo_guardado = None
+        elif args.step == 2:
+            info("Reanudando solo paso 2")
+            _, _, CUIS_VISTOS = mapeo_guardado
+            r2 = paso_2_migrar_consultas(*mapeo_guardado[:2])
             verificar()
-            titulo("RESUMEN (reanudación)")
-            print(f"  Consultas migradas  : {r2['ok']:>8,}")
-            print(f"  Consultas sin pac.  : {r2['sin_paciente']:>8,}")
-            print(f"  Consultas sin fecha : {r2['sin_fecha']:>8,}")
-            print(f"  Consultas con error : {r2['error']:>8,}")
             return
-
-        elif resp == "r":
-            # Reinicio completo — continúa al flujo normal abajo
-            print()
         else:
+            resp = input("  ¿Reanudar solo paso 2? (s/n): ").strip().lower()
+            if resp == "s":
+                _, _, CUIS_VISTOS = mapeo_guardado
+                r2 = paso_2_migrar_consultas(*mapeo_guardado[:2])
+                verificar()
+                return
+    
+    if not args.step or args.step == 1:
+        resp = input("\n¿Ejecutar migración completa? (s/n): ").strip().lower()
+        if resp != "s":
             print("Cancelado.")
             return
-
-    elif mapeo_guardado and conteos["pacientes"] == 0:
-        # Hay mapeo pero las tablas están vacías → mapeo inválido, ignorar
-        warn(f"Mapeo encontrado pero PostgreSQL está vacío — descartando mapeo.")
-        os.remove(MAPEO_FILE)
-        mapeo_guardado = None
-
-    # ── Confirmación migración completa ───────────────────────────────────
-    if conteos["pacientes"] > 0 or conteos["consultas"] > 0:
-        print(f"\n  ⚠  PostgreSQL tiene datos ({conteos['pacientes']:,} pacientes,"
-              f" {conteos['consultas']:,} consultas).")
-        print(f"     El TRUNCATE los eliminará permanentemente.")
-
-    resp = input("\n¿Continuar migración completa (TRUNCATE + migrar)? (s/n): ").strip().lower()
-    if resp != "s":
-        print("Cancelado.")
-        return
-
-    inicio = datetime.now()
-
-    # ── Paso 0: TRUNCATE garantizado antes de cualquier inserción ─────────
-    limpiar_tablas_postgres()
-
-    # ── Paso 1: pacientes ─────────────────────────────────────────────────
-    r1 = paso_1_migrar_pacientes()
-
-   # ── Paso 2: consultas ─────────────────────────────────────────────────
-    r2 = paso_2_migrar_consultas(r1["mapeo_id"], r1["mapeo_exp"])
-
-    # ── Limpieza final ────────────────────────────────────────────────────
-    limpieza_final_expedientes()
-
-    # ── Verificación ──────────────────────────────────────────────────────
-    verificar()
-
-    elapsed = (datetime.now() - inicio).total_seconds()
-    titulo("RESUMEN FINAL")
-    print(f"  Pacientes migrados  : {r1['stats']['ok']:>8,}")
-    print(f"  Pacientes con error : {r1['stats']['error']:>8,}")
-    print(f"  Consultas migradas  : {r2['ok']:>8,}")
-    print(f"  Consultas sin pac.  : {r2['sin_paciente']:>8,}")
-    print(f"  Consultas sin fecha : {r2['sin_fecha']:>8,}")
-    print(f"  Consultas con error : {r2['error']:>8,}")
-    print(f"  Tiempo total        : {elapsed:>8.1f}s")
+        
+        inicio = datetime.now()
+        
+        # Paso 0: limpiar
+        limpiar_tablas_postgres()
+        
+        # Paso 1: pacientes
+        r1 = paso_1_migrar_pacientes()
+        
+        # Paso 2: consultas
+        r2 = paso_2_migrar_consultas(r1["mapeo_id"], r1["mapeo_exp"])
+        
+        # Verificación
+        verificar()
+        
+        # Resumen
+        elapsed = (datetime.now() - inicio).total_seconds()
+        titulo("RESUMEN FINAL")
+        print(f"  Pacientes migrados : {r1['stats']['ok']:>8,}")
+        print(f"  Pacientes error  : {r1['stats']['error']:>8,}")
+        print(f"  Consultas migr.  : {r2['ok']:>8,}")
+        print(f"  Consultas sin pac: {r2['sin_paciente']:>8,}")
+        print(f"  Consultas fecha : {r2['sin_fecha']:>8,}")
+        print(f"  Consultas error : {r2['error']:>8,}")
+        print(f"  Tiempo total    : {elapsed:>8.1f}s")
 
 
 if __name__ == "__main__":

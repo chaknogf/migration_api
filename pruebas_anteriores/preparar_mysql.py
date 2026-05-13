@@ -7,6 +7,7 @@ import sys
 import unicodedata
 from sqlalchemy import text
 from database.database import init_db
+from datetime import datetime
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,24 +113,156 @@ def merge_campos(base: dict, otros: list[dict],
     """
     Combina registros rellenando campos vacíos del base con valores de otros.
     Acumula expedientes migrados en exp_migrado (CSV).
+    PRESERVA created_at (más antigua) y updated_at (más reciente)
     """
-    excluir = excluir or {"id", "created_at", "update_at", "updated_at"}
+    excluir = excluir or {"id"}
+    
+    # Para created_at: tomar la más antigua (mínimo timestamp)
+    # Para updated_at: tomar la más reciente (máximo timestamp)
+    timestamps_base = {
+        "created_at": base.get("created_at"),
+        "updated_at": base.get("updated_at")
+    }
+    
     exp_migrados: list[str] = []
 
     for otro in otros:
         if otro.get("expediente"):
             exp_migrados.append(str(otro["expediente"]))
+        
+        # Actualizar created_at con la más antigua
+        otro_created = otro.get("created_at")
+        if otro_created and timestamps_base["created_at"]:
+            if otro_created < timestamps_base["created_at"]:
+                timestamps_base["created_at"] = otro_created
+        elif otro_created and not timestamps_base["created_at"]:
+            timestamps_base["created_at"] = otro_created
+        
+        # Actualizar updated_at con la más reciente
+        otro_updated = otro.get("updated_at")
+        if otro_updated and timestamps_base["updated_at"]:
+            if otro_updated > timestamps_base["updated_at"]:
+                timestamps_base["updated_at"] = otro_updated
+        elif otro_updated and not timestamps_base["updated_at"]:
+            timestamps_base["updated_at"] = otro_updated
+        
         for k, v in otro.items():
             if k in excluir:
                 continue
             if base.get(k) in (None, "", 0) and v not in (None, "", 0):
                 base[k] = v
 
+    # Aplicar timestamps preservados
+    base["created_at"] = timestamps_base["created_at"]
+    base["updated_at"] = timestamps_base["updated_at"]
+
     existentes = base.get("exp_migrado") or ""
     lista_exist = [e.strip() for e in existentes.split(",") if e.strip()]
     todos = sorted(set(lista_exist + exp_migrados))
     base["exp_migrado"] = ",".join(todos) if todos else None
     return base
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASO 0 — RELLENAR CONSULTAS DESDE PACIENTES
+# Copia nombre, apellido, sexo, dpi desde pacientes → consultas
+# para registros que tienen expediente pero campos de paciente vacíos.
+# Se ejecuta antes de cualquier limpieza para enriquecer los datos crudos.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def paso_0_rellenar_consultas_desde_pacientes():
+    titulo("PASO 0 — RELLENAR CONSULTAS DESDE PACIENTES")
+    db = init_db()
+    session = db["MySQLSession"]()
+
+    try:
+        # ── Obtener consultas con expediente pero sin datos de paciente ──
+        info("Buscando consultas con expediente y campos vacíos...")
+        consultas = session.execute(text("""
+            SELECT id, expediente, nombres, apellidos, sexo, dpi
+            FROM consultas
+            WHERE expediente IS NOT NULL
+              AND expediente != 0
+              AND (
+                  nombres   IS NULL OR TRIM(nombres)   = ''
+               OR apellidos IS NULL OR TRIM(apellidos) = ''
+               OR sexo      IS NULL OR TRIM(sexo)      = ''
+               OR dpi       IS NULL OR dpi = 0
+              )
+        """)).mappings().all()
+
+        total = len(consultas)
+        info(f"{total:,} consultas candidatas encontradas")
+
+        if total == 0:
+            ok("Nada que actualizar.")
+            return
+
+        # ── Procesar cada consulta ───────────────────────────────────────
+        actualizadas = 0
+        sin_match    = 0
+
+        for i, c in enumerate(consultas, 1):
+            # Buscar el paciente por expediente
+            paciente = session.execute(text("""
+                SELECT nombre, apellido, sexo, dpi
+                FROM pacientes
+                WHERE expediente = :exp
+                LIMIT 1
+            """), {"exp": c["expediente"]}).mappings().fetchone()
+
+            barra(i, total, prefijo="  Procesando ")
+
+            if not paciente:
+                sin_match += 1
+                continue
+
+            # Construir solo los campos que faltan en la consulta
+            updates = {}
+
+            if not c.get("nombres") or str(c["nombres"]).strip() == "":
+                if paciente["nombre"]:
+                    updates["nombres"] = paciente["nombre"]
+
+            if not c.get("apellidos") or str(c["apellidos"]).strip() == "":
+                if paciente["apellido"]:
+                    updates["apellidos"] = paciente["apellido"]
+
+            if not c.get("sexo") or str(c["sexo"]).strip() == "":
+                if paciente["sexo"]:
+                    updates["sexo"] = paciente["sexo"]
+
+            if not c.get("dpi") or c["dpi"] == 0:
+                if paciente["dpi"]:
+                    updates["dpi"] = paciente["dpi"]
+
+            if not updates:
+                continue  # paciente tampoco tiene esos datos
+
+            sets_sql = ", ".join([f"{col} = :{col}" for col in updates])
+            updates["id"] = c["id"]
+
+            session.execute(text(
+                f"UPDATE consultas SET {sets_sql} WHERE id = :id"
+            ), updates)
+            actualizadas += 1
+
+            # Commit cada 500 para no acumular transacción enorme
+            if actualizadas % 500 == 0:
+                session.commit()
+
+        session.commit()
+        ok(f"Consultas actualizadas : {actualizadas:>7,}")
+        if sin_match:
+            print(f"  ⚠ Sin match en pacientes : {sin_match:>7,} (expediente no existe)")
+        ok("PASO 0 COMPLETADO")
+
+    except Exception as e:
+        session.rollback()
+        print(f"\n  ✗ Error en PASO 0: {e}")
+        raise
+    finally:
+        session.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +438,57 @@ def paso_2_limpiar_pacientes():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# UTILIDADES DE AUDITORÍA — MERGE LOG
+# Deben definirse ANTES de paso_3 porque ejecutar_merge las llama.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _crear_merge_log(session) -> None:
+    """
+    Crea la tabla de auditoría pacientes_merge_log si no existe.
+      id_eliminado         — id del registro borrado de pacientes_clean
+      id_sobreviviente     — id del registro que absorbió al eliminado
+      expediente_eliminado — expediente del registro borrado (trazabilidad)
+      expediente_sobreviviente — expediente del ganador
+      criterio             — 'expediente' | 'dpi_nombre' | 'nombre_nacimiento'
+      fusionado_en         — timestamp del merge
+    """
+    session.execute(text("""
+        CREATE TABLE IF NOT EXISTS pacientes_merge_log (
+            id                       INT AUTO_INCREMENT PRIMARY KEY,
+            id_eliminado             INT NOT NULL,
+            id_sobreviviente         INT NOT NULL,
+            expediente_eliminado     INT,
+            expediente_sobreviviente INT,
+            criterio                 VARCHAR(30),
+            fusionado_en             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_eliminado      (id_eliminado),
+            INDEX idx_sobreviviente  (id_sobreviviente),
+            INDEX idx_exp_elim       (expediente_eliminado)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """))
+    session.commit()
+
+
+def _registrar_merge(session, ganador: dict, perdedores: list[dict],
+                     criterio: str) -> None:
+    """Inserta una fila en pacientes_merge_log por cada perdedor."""
+    for p in perdedores:
+        session.execute(text("""
+            INSERT INTO pacientes_merge_log
+                (id_eliminado, id_sobreviviente,
+                 expediente_eliminado, expediente_sobreviviente, criterio)
+            VALUES
+                (:id_elim, :id_surv, :exp_elim, :exp_surv, :criterio)
+        """), {
+            "id_elim":  p["id"],
+            "id_surv":  ganador["id"],
+            "exp_elim": p.get("expediente"),
+            "exp_surv": ganador.get("expediente"),
+            "criterio": criterio,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PASO 3 — DEDUPLICAR Y COMBINAR pacientes → pacientes_clean
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -313,20 +497,24 @@ def paso_3_deduplicar_pacientes():
     db = init_db()
     session = db["MySQLSession"]()
 
-    EXCLUIR = {"id", "created_at", "update_at"}
+    EXCLUIR = {"id"}
 
-    def ejecutar_merge(registros: list) -> None:
+    def ejecutar_merge(registros: list, criterio: str = "desconocido") -> None:
         if len(registros) < 2:
             return
         base = dict(registros[0])
         otros = [dict(r) for r in registros[1:]]
         base = merge_campos(base, otros, excluir=EXCLUIR)
 
-        campos_up = [k for k in base if k not in EXCLUIR and k != "id"]
+        campos_up = [k for k in base if k not in EXCLUIR]
         sets_sql = ", ".join([f"{k} = :{k}" for k in campos_up])
         params = {k: base[k] for k in campos_up}
         params["id"] = base["id"]
         session.execute(text(f"UPDATE pacientes_clean SET {sets_sql} WHERE id = :id"), params)
+
+        # ── Registrar en el log ANTES de borrar ──────────────────────────
+        # Así queda trazabilidad de qué id absorbió a quién y con qué criterio.
+        _registrar_merge(session, base, otros, criterio)
 
         ids_borrar = [str(o["id"]) for o in otros]
         if ids_borrar:
@@ -335,6 +523,13 @@ def paso_3_deduplicar_pacientes():
             ))
 
     try:
+        # Crear / limpiar tabla de auditoría de merges
+        info("Preparando tabla pacientes_merge_log...")
+        session.execute(text("DROP TABLE IF EXISTS pacientes_merge_log"))
+        session.commit()
+        _crear_merge_log(session)
+        ok("pacientes_merge_log lista")
+
         # Recrear tabla
         info("Recreando pacientes_clean...")
         session.execute(text("DROP TABLE IF EXISTS pacientes_clean"))
@@ -373,7 +568,7 @@ def paso_3_deduplicar_pacientes():
                 SELECT * FROM pacientes_clean
                 WHERE expediente = :exp ORDER BY id DESC
             """), {"exp": exp}).mappings().all()
-            ejecutar_merge(list(registros))
+            ejecutar_merge(list(registros), criterio="expediente")
             barra(i, len(grupos), prefijo="  Fase A ")
 
         session.commit()
@@ -395,7 +590,7 @@ def paso_3_deduplicar_pacientes():
                   AND apellido = :apellido AND nacimiento <=> :nac
                 ORDER BY expediente DESC
             """), {"dpi": dpi, "nombre": nombre, "apellido": apellido, "nac": nac}).mappings().all()
-            ejecutar_merge(list(registros))
+            ejecutar_merge(list(registros), criterio="dpi_nombre")
             barra(i, len(grupos), prefijo="  Fase B ")
 
         session.commit()
@@ -418,7 +613,7 @@ def paso_3_deduplicar_pacientes():
                   AND nacimiento <=> :nac
                 ORDER BY expediente DESC
             """), {"nombre": nombre, "apellido": apellido, "nac": nac}).mappings().all()
-            ejecutar_merge(list(registros))
+            ejecutar_merge(list(registros), criterio="nombre_nacimiento")
             barra(i, len(grupos), prefijo="  Fase C ")
 
         session.commit()
@@ -483,6 +678,118 @@ def paso_3_deduplicar_pacientes():
     finally:
         session.close()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PASO 3b — REPARAR RELACIONES EN consultas USANDO EL MERGE LOG
+# Actualiza consultas.expediente para que apunte siempre al
+# expediente del paciente sobreviviente tras la deduplicación.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def paso_3b_reparar_consultas_post_merge():
+    """
+    Problema que resuelve:
+      Durante el Paso 3, registros de pacientes_clean fueron eliminados y
+      absorbidos por un ganador. Si el eliminado tenía un expediente distinto
+      al del ganador, las consultas que referenciaban ese expediente quedan
+      huérfanas. Este paso usa pacientes_merge_log para redirigirlas.
+
+    Garantías:
+      - Solo actualiza cuando el sobreviviente tiene expediente válido y
+        distinto al eliminado.
+      - Si el sobreviviente no tenía expediente, la consulta se deja intacta.
+      - El log queda intacto para auditoría posterior.
+    """
+    titulo("PASO 3b — REPARAR CONSULTAS POST-MERGE")
+    db = init_db()
+    session = db["MySQLSession"]()
+
+    try:
+        total_log = session.execute(text(
+            "SELECT COUNT(*) FROM pacientes_merge_log"
+        )).scalar()
+        info(f"pacientes_merge_log tiene {total_log:,} registros de merge")
+
+        if total_log == 0:
+            ok("No hubo merges — nada que reparar.")
+            return
+
+        # ── 1) Consultas con expediente que fue eliminado en el merge ─────
+        afectadas = session.execute(text("""
+            SELECT
+                c.id                             AS consulta_id,
+                c.expediente                     AS exp_actual,
+                ml.expediente_sobreviviente      AS exp_nuevo,
+                ml.criterio
+            FROM consultas c
+            INNER JOIN pacientes_merge_log ml
+                ON c.expediente = ml.expediente_eliminado
+            WHERE ml.expediente_sobreviviente IS NOT NULL
+              AND ml.expediente_sobreviviente != ml.expediente_eliminado
+              AND NOT EXISTS (
+                  SELECT 1 FROM pacientes_clean pc
+                  WHERE pc.expediente = c.expediente
+              )
+        """)).mappings().all()
+
+        total_afectadas = len(afectadas)
+        info(f"Consultas con expediente huérfano: {total_afectadas:,}")
+
+        if total_afectadas == 0:
+            ok("Ninguna consulta quedó huérfana — relaciones íntegras.")
+            return
+
+        # ── 2) Actualizar expediente en consultas ─────────────────────────
+        actualizadas = 0
+        for i, row in enumerate(afectadas, 1):
+            session.execute(text("""
+                UPDATE consultas
+                SET expediente = :exp_nuevo
+                WHERE id = :consulta_id
+                  AND expediente = :exp_actual
+            """), {
+                "exp_nuevo":   row["exp_nuevo"],
+                "consulta_id": row["consulta_id"],
+                "exp_actual":  row["exp_actual"],
+            })
+            actualizadas += 1
+            if actualizadas % 500 == 0:
+                session.commit()
+            barra(i, total_afectadas, prefijo="  Actualizando ")
+
+        session.commit()
+        ok(f"Consultas reparadas: {actualizadas:,}")
+
+        # ── 3) Reportar huérfanas irresolubles (sobreviviente sin expediente) ─
+        huerfanas = session.execute(text("""
+            SELECT COUNT(DISTINCT c.id)
+            FROM consultas c
+            INNER JOIN pacientes_merge_log ml
+                ON c.expediente = ml.expediente_eliminado
+            WHERE ml.expediente_sobreviviente IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pacientes_clean pc
+                  WHERE pc.expediente = c.expediente
+              )
+        """)).scalar()
+
+        if huerfanas:
+            print(f"\n  ⚠ {huerfanas:,} consultas cuyo sobreviviente no tenía expediente.")
+            print(f"    Se mantiene su expediente original como referencia histórica.")
+            print(f"    Para revisión manual:")
+            print(f"      SELECT c.id, c.expediente, ml.* FROM consultas c")
+            print(f"      JOIN pacientes_merge_log ml ON c.expediente = ml.expediente_eliminado")
+            print(f"      WHERE ml.expediente_sobreviviente IS NULL;")
+
+        ok("PASO 3b COMPLETADO")
+
+    except Exception as e:
+        session.rollback()
+        print(f"\n  ✗ Error en PASO 3b: {e}")
+        raise
+    finally:
+        session.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PASO 4 — EXTRAER PACIENTES NUEVOS DE consultas → pacientes_nuevos
 # Pacientes que están en consultas pero NO en pacientes_clean
@@ -509,7 +816,9 @@ def paso_4_pacientes_nuevos_de_consultas():
                 dpi         BIGINT,
                 telefono    VARCHAR(50),
                 direccion   VARCHAR(100),
-                hojas_emergencia TEXT
+                hojas_emergencia TEXT,
+                created_at TIMESTAMP NULL,
+                updated_at TIMESTAMP NULL
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """))
         session.commit()
@@ -521,13 +830,14 @@ def paso_4_pacientes_nuevos_de_consultas():
         session.execute(text("""
             INSERT INTO pacientes_nuevos
                 (expediente, nombres, apellidos, nacimiento, sexo, dpi,
-                 telefono, direccion, hojas_emergencia)
+                 telefono, direccion, hojas_emergencia, created_at, updated_at)
             SELECT
                 expediente,
                 MAX(nombres), MAX(apellidos), MAX(nacimiento),
                 MAX(sexo), MAX(dpi), MAX(telefono), MAX(direccion),
                 NULLIF(GROUP_CONCAT(DISTINCT hoja_emergencia
-                       ORDER BY hoja_emergencia SEPARATOR ','), '')
+                       ORDER BY hoja_emergencia SEPARATOR ','), ''),
+                MIN(created_at), MAX(updated_at)
             FROM consultas
             WHERE expediente IS NOT NULL
             GROUP BY expediente
@@ -539,6 +849,7 @@ def paso_4_pacientes_nuevos_de_consultas():
         info("Fase 2: candidatos por nombre + DPI...")
         grupos = session.execute(text("""
             SELECT nombres, apellidos, nacimiento, dpi,
+                   MIN(created_at) AS min_created, MAX(updated_at) AS max_updated,
                    GROUP_CONCAT(DISTINCT hoja_emergencia) AS hojas
             FROM consultas
             WHERE expediente IS NULL AND dpi IS NOT NULL
@@ -555,8 +866,10 @@ def paso_4_pacientes_nuevos_de_consultas():
             if not existe:
                 session.execute(text("""
                     INSERT INTO pacientes_nuevos
-                        (nombres, apellidos, nacimiento, dpi, hojas_emergencia)
-                    VALUES (:nombres, :apellidos, :nacimiento, NULLIF(CAST(:dpi AS UNSIGNED), 0), :hojas)
+                        (nombres, apellidos, nacimiento, dpi, hojas_emergencia,
+                         created_at, updated_at)
+                    VALUES (:nombres, :apellidos, :nacimiento, NULLIF(CAST(:dpi AS UNSIGNED), 0),
+                            :hojas, :min_created, :max_updated)
                 """), g)
             barra(i, len(grupos), prefijo="  Fase 2 ")
         session.commit()
@@ -569,6 +882,7 @@ def paso_4_pacientes_nuevos_de_consultas():
         grupos = session.execute(text("""
             SELECT nombres, apellidos, nacimiento,
                    COUNT(*) AS total_consultas,
+                   MIN(created_at) AS min_created, MAX(updated_at) AS max_updated,
                    NULLIF(GROUP_CONCAT(DISTINCT hoja_emergencia
                           ORDER BY hoja_emergencia SEPARATOR ','), '') AS hojas
             FROM consultas
@@ -594,8 +908,10 @@ def paso_4_pacientes_nuevos_de_consultas():
             if not existe:
                 session.execute(text("""
                     INSERT INTO pacientes_nuevos
-                        (nombres, apellidos, nacimiento, hojas_emergencia)
-                    VALUES (:nombres, :apellidos, :nacimiento, :hojas)
+                        (nombres, apellidos, nacimiento, hojas_emergencia,
+                         created_at, updated_at)
+                    VALUES (:nombres, :apellidos, :nacimiento, :hojas,
+                            :min_created, :max_updated)
                 """), g)
             barra(i, len(grupos), prefijo="  Fase 3 ")
         session.commit()
@@ -698,7 +1014,9 @@ def _limpiar_dpi_duplicados(session, tabla: str) -> None:
                 SELECT id,
                        COALESCE(expediente, 0)                         AS _exp,
                        COALESCE(fuente, '')                            AS _fuente,
-                       cui_duplicado
+                       cui_duplicado,
+                       created_at,
+                       updated_at
                 FROM {tabla}
                 WHERE dpi = :dpi
                 ORDER BY
@@ -818,7 +1136,9 @@ def paso_5_construir_master():
                 exp_migrado      VARCHAR(255),
                 hojas_emergencia TEXT,
                 cui_duplicado    VARCHAR(255),      -- DPIs desplazados por unicidad
-                fuente           VARCHAR(20)        -- 'pacientes' | 'consultas'
+                fuente           VARCHAR(20),        -- 'pacientes' | 'consultas'
+                created_at TIMESTAMP NULL,
+                updated_at TIMESTAMP NULL
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """))
         session.commit()
@@ -834,7 +1154,7 @@ def paso_5_construir_master():
                 email, padre, madre, responsable, parentesco, dpi_responsable,
                 telefono_responsable, estado, exp_madre, gemelo, conyugue, exp_ref,
                 created_by, fechaDefuncion, hora_defuncion, exp_migrado,
-                cui_duplicado, fuente
+                cui_duplicado, fuente, created_at, updated_at
             )
             SELECT
                 expediente, nombre, apellido, nacimiento, sexo, dpi, pasaporte,
@@ -843,7 +1163,7 @@ def paso_5_construir_master():
                 email, padre, madre, responsable, parentesco, dpi_responsable,
                 telefono_responsable, estado, exp_madre, gemelo, conyugue, exp_ref,
                 created_by, fechaDefuncion, hora_defuncion, exp_migrado,
-                cui_duplicado, 'pacientes'
+                cui_duplicado, 'pacientes', created_at, updated_at
             FROM pacientes_clean
         """))
         session.commit()
@@ -855,13 +1175,14 @@ def paso_5_construir_master():
         session.execute(text("""
             INSERT INTO pacientes_master (
                 expediente, nombre, apellido, nacimiento, sexo,
-                dpi, telefono, direccion, hojas_emergencia, fuente
+                dpi, telefono, direccion, hojas_emergencia, fuente,
+                created_at, updated_at
             )
             SELECT
-                expediente, nombres, apellidos, nacimiento, sexo,
-                dpi, telefono, direccion, hojas_emergencia, 'consultas'
+                expediente, nombres, apellidos, nacimiento, sexo, dpi, telefono,
+                direccion, hojas_emergencia, 'consultas', created_at, updated_at
             FROM pacientes_nuevos
-        """))
+            """))
         session.commit()
 
         total_antes = session.execute(text("SELECT COUNT(*) FROM pacientes_master")).scalar()
@@ -937,8 +1258,8 @@ def paso_6_crear_consultas_master():
                 folios              INT,
                 medico              VARCHAR(25),
 
-                created_at          TIMESTAMP,
-                updated_at          TIMESTAMP,
+                created_at          TIMESTAMP NULL,
+                updated_at          TIMESTAMP NULL,
                 archived_by         VARCHAR(10),
                 created_by          VARCHAR(10),
                 consulta_por        INT,
@@ -1067,29 +1388,46 @@ def paso_6_crear_consultas_master():
                     paciente_id = row[0]
                     criterio = "unico_consulta"
 
-            # ── 5) Sin datos mínimos — crear paciente en el momento ───────
-            # Solo llega aquí si no tiene nombre ni apellido (ruido residual)
-            # o si por alguna razón no se encontró en pacientes_master.
-            # En ese caso se inserta como paciente nuevo ahora mismo.
+            # ── 5) Crear paciente en el momento — con deduplicación por DPI ─
+            # Antes de insertar, verificar si el DPI ya existe en
+            # pacientes_master. Si existe, reutilizar ese registro para evitar
+            # crear un duplicado que bloquearía el UNIQUE de PostgreSQL.
             if not paciente_id and c["nombres"] and c["apellidos"]:
-                ins = session.execute(text("""
-                    INSERT INTO pacientes_master
-                        (nombre, apellido, nacimiento, sexo, dpi,
-                         telefono, direccion, fuente)
-                    VALUES
-                        (:nombres, :apellidos, :nac, :sexo, :dpi,
-                         :telefono, :direccion, 'consulta_directa')
-                """), {
-                    "nombres":   c["nombres"],
-                    "apellidos": c["apellidos"],
-                    "nac":       c["nacimiento"],
-                    "sexo":      c["sexo"],
-                    "dpi":       int(c["dpi"]) if c["dpi"] else None,
-                    "telefono":  c["telefono"],
-                    "direccion": c["direccion"],
-                })
-                paciente_id = ins.lastrowid
-                criterio = "creado_directo"
+
+                # 5a) Búsqueda defensiva por DPI antes de insertar
+                if c["dpi"]:
+                    row = session.execute(text("""
+                        SELECT id FROM pacientes_master
+                        WHERE dpi = :dpi
+                        LIMIT 1
+                    """), {"dpi": int(c["dpi"])}).fetchone()
+                    if row:
+                        paciente_id = row[0]
+                        criterio = "creado_directo"
+
+                # 5b) Si no se encontró por DPI, crear registro nuevo
+                if not paciente_id:
+                    ins = session.execute(text("""
+                        INSERT INTO pacientes_master
+                            (nombre, apellido, nacimiento, sexo, dpi,
+                             telefono, direccion, fuente, created_at, updated_at)
+                        VALUES
+                            (:nombres, :apellidos, :nac, :sexo, :dpi,
+                             :telefono, :direccion, 'consulta_directa',
+                             :created_at, :updated_at)
+                    """), {
+                        "nombres":   c["nombres"],
+                        "apellidos": c["apellidos"],
+                        "nac":       c["nacimiento"],
+                        "sexo":      c["sexo"],
+                        "dpi":       int(c["dpi"]) if c["dpi"] else None,
+                        "telefono":  c["telefono"],
+                        "direccion": c["direccion"],
+                        "created_at": c["created_at"],
+                        "updated_at": c["updated_at"],
+                    })
+                    paciente_id = ins.lastrowid
+                    criterio = "creado_directo"
 
             # ── 6) Sin coincidencia real ──────────────────────────────────
             stats[criterio if criterio in stats else "sin_match"] += 1
@@ -1118,6 +1456,14 @@ def paso_6_crear_consultas_master():
         print(f"    Registro único consulta : {stats['unico_consulta']:>7,}")
         print(f"    Creado en el momento    : {stats['creado_directo']:>7,}")
         print(f"    Sin coincidencia (NULL) : {stats['sin_match']:>7,}")
+
+        # ── Red de seguridad: limpiar DPIs duplicados introducidos ───────
+        # El criterio "creado_directo" puede haber insertado pacientes con
+        # DPI que ya existía en pacientes_master (dos consultas con mismo DPI
+        # procesadas antes de que el commit intermedio sea visible).
+        # _limpiar_dpi_duplicados garantiza unicidad antes de migrar a PG.
+        info("Verificando unicidad de DPI tras inserciones directas...")
+        _limpiar_dpi_duplicados(session, "pacientes_master")
 
     except Exception as e:
         session.rollback()
@@ -1277,9 +1623,11 @@ if __name__ == "__main__":
             session.close()
 
     pasos = {
-        "1":  ("Limpiar consultas",                   paso_1_limpiar_consultas),
+        "0":  ("Rellenar consultas desde pacientes",   paso_0_rellenar_consultas_desde_pacientes),
+        "1":  ("Limpiar consultas",                    paso_1_limpiar_consultas),
         "2":  ("Limpiar pacientes",                    paso_2_limpiar_pacientes),
         "3":  ("Deduplicar pacientes → clean",         paso_3_deduplicar_pacientes),
+        "3b": ("Reparar consultas post-merge",          paso_3b_reparar_consultas_post_merge),
         "4":  ("Pacientes nuevos de consultas",         paso_4_pacientes_nuevos_de_consultas),
         "5":  ("Construir pacientes_master",            paso_5_construir_master),
         "5b": ("Limpiar DPI duplicados en master",      paso_5b_standalone),
@@ -1287,7 +1635,7 @@ if __name__ == "__main__":
     }
 
     if len(sys.argv) > 1:
-        # Modo selectivo: python preparar_mysql.py 1 3 6
+        # Modo selectivo: python preparar_mysql.py 0 1 3 6
         seleccion = sys.argv[1:]
         for num in seleccion:
             if num in pasos:

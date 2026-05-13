@@ -22,9 +22,11 @@ FIXES aplicados:
   - Bug: telefono_responsable se limpiaba dos veces
   - Bug: expediente fallback "X?" generaba duplicados cuando consulta_id es NULL
   - Bug: reanudación saltaba el TRUNCATE → tablas con datos mixtos
+  - Bug: fechas creado_en/actualizado_en se sobreescribían con datetime.now()
   - Mejora: mapeo_id y mapeo_exp se serializan a disco tras paso 1
   - Mejora: reintento individual cuando falla un lote en paso 2
   - Mejora: verificación de tablas vacías antes de decidir reanudación
+  - Mejora: ordenamiento por fecha de creación original (created_at)
 """
 
 import os
@@ -95,6 +97,45 @@ MAPEO_FILE   = "mapeo_migracion.json"
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILIDADES
 # ─────────────────────────────────────────────────────────────────────────────
+
+def parse_fecha_mysql(valor: Any) -> Optional[datetime]:
+    """
+    Convierte una fecha/hora de MySQL a datetime de Python.
+    Acepta strings, datetime o date.
+    Retorna None si el valor es inválido o None.
+    """
+    if valor is None:
+        return None
+    
+    # Si ya es datetime o date, convertir a datetime
+    if isinstance(valor, datetime):
+        return valor
+    if isinstance(valor, date):
+        return datetime.combine(valor, datetime.min.time())
+    
+    # Si es string, intentar parsear
+    if isinstance(valor, str):
+        valor = valor.strip()
+        if not valor:
+            return None
+        
+        # Intentar formatos comunes de MySQL
+        formatos = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y",
+        ]
+        
+        for fmt in formatos:
+            try:
+                return datetime.strptime(valor, fmt)
+            except ValueError:
+                continue
+    
+    return None
+
 
 def barra(actual: int, total: int, largo: int = 35, prefijo: str = "") -> None:
     if total == 0:
@@ -177,7 +218,7 @@ ON CONFLICT (expediente) DO UPDATE SET
     cui             = COALESCE(EXCLUDED.cui, pacientes.cui),
     nombre          = EXCLUDED.nombre,
     nombre_completo = EXCLUDED.nombre_completo,
-    actualizado_en  = NOW()
+    actualizado_en  = EXCLUDED.actualizado_en
 RETURNING id
 """).bindparams(
     bindparam("nombre",      type_=JSON),
@@ -271,6 +312,11 @@ def transformar_paciente(row: Dict) -> Dict:
     if row.get("fuente") and metadatos_json:
         metadatos_json[0]["fuente_mysql"] = row["fuente"]
 
+    # ── CORRECCIÓN: Preservar fechas originales de MySQL ──────────────────
+    # Usar created_at y update_at de MySQL, con fallback a datetime.now()
+    creado_en      = parse_fecha_mysql(row.get("created_at")) or datetime.now()
+    actualizado_en = parse_fecha_mysql(row.get("update_at")) or datetime.now()
+
     return {
         "expediente":       expediente,
         "cui":              cui,
@@ -284,8 +330,8 @@ def transformar_paciente(row: Dict) -> Dict:
         "estado":           normalizar_estado(row.get("estado")),
         "metadatos":        json_safe(metadatos_json),
         "nombre_completo":  _nombre_completo(row.get("nombre",""), row.get("apellido","")),
-        "creado_en":        row.get("created_at"),
-        "actualizado_en":   row.get("update_at")  ,
+        "creado_en":        creado_en,
+        "actualizado_en":   actualizado_en,
     }
 
 
@@ -332,6 +378,11 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
     c_norm = normalizar_consulta_completa(row)
     if not c_norm:
         return None
+    
+    # ── CORRECCIÓN: Preservar fechas originales de MySQL ──────────────────
+    creado_en      = parse_fecha_mysql(row.get("created_at")) or datetime.now()
+    actualizado_en = parse_fecha_mysql(row.get("updated_at")) or datetime.now()
+    
     return {
         "expediente":     expediente_pg,
         "paciente_id":    row["paciente_id"],
@@ -344,8 +395,8 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
         "indicadores":    json_safe(_construir_indicadores(row)),
         "ciclo":          json_safe(_construir_ciclo(row, c_norm)),
         "orden":          None,
-        "creado_en":      row.get("created_at"),
-        "actualizado_en": row.get("updated_at"),
+        "creado_en":      creado_en,
+        "actualizado_en": actualizado_en,
         "activo":         True,
     }
 
@@ -404,8 +455,9 @@ def paso_1_migrar_pacientes() -> Dict[str, Any]:
         ).scalar()
         info(f"Total pacientes_master: {stats['total']:,}")
 
+        # ── CORRECCIÓN: Ordenar por fecha de creación original ──────────────
         rows = mysql_db.execute(
-            text("SELECT * FROM pacientes_master ORDER BY id")
+            text("SELECT * FROM pacientes_master ORDER BY created_at ASC, id ASC")
         ).mappings().all()
 
         for i, row in enumerate(rows, 1):
@@ -495,8 +547,9 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
         ).scalar()
         info(f"Total consultas_master: {stats['total']:,}")
 
+        # ── CORRECCIÓN: Ordenar por fecha de creación original ──────────────
         rows = mysql_db.execute(
-            text("SELECT * FROM consultas_master ORDER BY id")
+            text("SELECT * FROM consultas_master ORDER BY created_at ASC, id ASC")
         ).mappings().all()
 
         batch: List[Dict] = []
@@ -517,7 +570,7 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
             if not exp_mysql:
                 # Fallback seguro: consulta_id siempre existe, nunca NULL
                 fallback_id = row.get("consulta_id") or row.get("id")
-                expediente_pg =  None #f"XCONSULTA{fallback_id}"
+                expediente_pg = None  # f"XCONSULTA{fallback_id}"
             else:
                 expediente_pg = mapeo_exp.get(exp_mysql, exp_mysql)
 
@@ -614,6 +667,33 @@ def verificar():
         )).scalar()
         print(f"\n  Consultas sin paciente_id (PG): {huerfanas:,}")
 
+        # ── CORRECCIÓN: Verificar distribución de fechas ──────────────────
+        print("\n  Verificación de fechas preservadas:")
+        
+        # Mostrar rango de fechas de creación
+        rango_pacientes = postgres_db.execute(text("""
+            SELECT 
+                MIN(creado_en) as min_creado,
+                MAX(creado_en) as max_creado,
+                MIN(actualizado_en) as min_actualizado,
+                MAX(actualizado_en) as max_actualizado
+            FROM pacientes
+        """)).fetchone()
+        
+        rango_consultas = postgres_db.execute(text("""
+            SELECT 
+                MIN(creado_en) as min_creado,
+                MAX(creado_en) as max_creado,
+                MIN(actualizado_en) as min_actualizado,
+                MAX(actualizado_en) as max_actualizado
+            FROM consultas
+        """)).fetchone()
+        
+        print(f"    Pacientes - Creado entre: {rango_pacientes[0]} y {rango_pacientes[1]}")
+        print(f"    Pacientes - Actualizado entre: {rango_pacientes[2]} y {rango_pacientes[3]}")
+        print(f"    Consultas - Creado entre: {rango_consultas[0]} y {rango_consultas[1]}")
+        print(f"    Consultas - Actualizado entre: {rango_consultas[2]} y {rango_consultas[3]}")
+
         print("\n  Distribución por criterio de match (desde ciclo JSONB):")
         criterios = postgres_db.execute(text("""
             SELECT ciclo->>'match_criterio' AS criterio, COUNT(*) AS total
@@ -625,11 +705,49 @@ def verificar():
         for criterio, total in criterios:
             print(f"    {(criterio or 'NULL'):<25} {total:>10,}")
 
+        # Verificar orden cronológico (CORREGIDO para manejar NULLs)
+        print("\n  Verificación de orden cronológico (primeros 5 registros):")
+        primeros_pacientes = postgres_db.execute(text("""
+            SELECT 
+                COALESCE(expediente, 'SIN_EXP') as expediente, 
+                nombre_completo, 
+                creado_en 
+            FROM pacientes 
+            ORDER BY creado_en ASC 
+            LIMIT 5
+        """)).fetchall()
+        
+        for exp, nombre, fecha in primeros_pacientes:
+            # Manejar valores None de forma segura
+            exp_str = str(exp) if exp is not None else "NULL"
+            nombre_str = str(nombre) if nombre is not None else "SIN_NOMBRE"
+            fecha_str = str(fecha) if fecha is not None else "SIN_FECHA"
+            print(f"    Exp: {exp_str:<10} | {nombre_str:<30} | {fecha_str}")
+
+        # Verificar pacientes con expediente NULL después de limpieza
+        sin_expediente = postgres_db.execute(text("""
+            SELECT COUNT(*) FROM pacientes WHERE expediente IS NULL
+        """)).scalar()
+        print(f"\n  Pacientes con expediente NULL (limpiados): {sin_expediente:,}")
+
+        # Mostrar distribución de fechas de creación por año
+        print("\n  Distribución de pacientes por año de creación:")
+        distribucion_anual = postgres_db.execute(text("""
+            SELECT 
+                EXTRACT(YEAR FROM creado_en) as año,
+                COUNT(*) as total
+            FROM pacientes
+            WHERE creado_en IS NOT NULL
+            GROUP BY año
+            ORDER BY año
+        """)).fetchall()
+        
+        for año, total in distribucion_anual:
+            print(f"    {int(año)}: {total:>8,} pacientes")
+
     finally:
         mysql_db.close()
         postgres_db.close()
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────

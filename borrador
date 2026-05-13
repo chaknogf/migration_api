@@ -1,59 +1,71 @@
 START TRANSACTION;
 
 UPDATE consultas
-SET 
-    nombres = 'Angelina',
-    apellidos = 'Marroquín Cuscún de Marroquin',
+SET
+    nombres = 'Jackeline Camila',
+    apellidos = 'Lol Chanchavac',
     sexo = 'F',
-    expediente = 79556,
-    dpi = 2050877600406
-WHERE id IN (717, 19382, 19568, 94940, 95339, 95500, 99598, 125479, 125550, 126790, 127155, 127238);
+    expediente = 64934,
+    dpi = 3093294260406
+WHERE
+    id IN (
+        161992,
+        157393,
+        159770,
+        160273,
+        160902,
+        161816
+    );
 
-
-SELECT id, nombres, apellidos, sexo, expediente, nacimiento
+SELECT
+    id,
+    nombres,
+    apellidos,
+    sexo,
+    expediente,
+    nacimiento
 FROM consultas
-WHERE id IN (717, 19382, 19568, 94940, 95339, 95500, 99598, 125479, 125550, 126790, 127155, 127238);
-
+WHERE
+    id IN (
+        161992,
+        157393,
+        159770,
+        160273,
+        160902,
+        161816
+    );
 -- Si todo está correcto:
 COMMIT;
 
 -- Si algo no cuadra:
 -- ROLLBACK;
 
+UPDATE cons_nac SET colegiado = 17957 WHERE colegiado = 17597;
 
+UPDATE cons_nac SET colegiado = 21734 WHERE colegiado = 21374;
 
-UPDATE cons_nac
-SET colegiado = 17957
-WHERE colegiado = 17597;
+UPDATE cons_nac SET colegiado = 23302 WHERE colegiado = 29302;
 
-UPDATE cons_nac
-SET colegiado = 21734
-WHERE colegiado = 21374;
-
-UPDATE cons_nac
-SET colegiado = 23302
-WHERE colegiado = 29302;
-
-
-
-INSERT INTO pacientes (
-    expediente,
-    nombre,
-    apellido,
-    dpi,
-    sexo,
-    nacimiento,
-    direccion,
-    telefono,
-    estado
-) VALUES (
-    43029,
-    'Angelica',
-    'España Luc de Chipix',
-    1947870360402,
-    'F',
-    '1985-10-02',
-    'Aldea Hacienda Maria, San Jose Poaquil',
-    '32621006',
-    'v'
-);
+INSERT INTO
+    pacientes (
+        expediente,
+        nombre,
+        apellido,
+        dpi,
+        sexo,
+        nacimiento,
+        direccion,
+        telefono,
+        estado
+    )
+VALUES (
+        43029,
+        'Angelica',
+        'España Luc de Chipix',
+        1947870360402,
+        'F',
+        '1985-10-02',
+        'Aldea Hacienda Maria, San Jose Poaquil',
+        '32621006',
+        'v'
+    );

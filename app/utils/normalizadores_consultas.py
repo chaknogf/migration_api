@@ -15,7 +15,7 @@ import re
 def normalizar_tipo_consulta(tipo: Optional[int]) -> Optional[int]:
     """
     Normaliza tipo de consulta
-    Valores típicos: 1=Primera, 2=Subsecuente, 3=Urgencia, etc.
+    Valores típicos: 1=COEX, 2=Hospitalizacion, 3=Emergencia, etc.
     """
     if tipo is None:
         return None
@@ -153,7 +153,7 @@ def normalizar_estado_ciclo(status: Optional[int]) -> str:
     """
     Normaliza el estado del ciclo basado en el status de la consulta
     1 = "admision"
-    2 = "recepcion"
+    2 = "archivo"
     Otro/NULL = "recepcion" (por defecto)
     """
     if status is None:
@@ -165,7 +165,7 @@ def normalizar_estado_ciclo(status: Optional[int]) -> str:
         # Mapeo de status a estado del ciclo
         STATUS_TO_ESTADO = {
             1: "admision",
-            2: "recepcion",
+            2: "archivo",
         }
         
         return STATUS_TO_ESTADO.get(status_int, "recepcion")
