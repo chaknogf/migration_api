@@ -332,6 +332,10 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
     c_norm = normalizar_consulta_completa(row)
     if not c_norm:
         return None
+    
+    # Obtener fecha_consulta para usar como fallback
+    fecha_consulta = c_norm["fecha_consulta"]
+    
     return {
         "expediente":     expediente_pg,
         "paciente_id":    row["paciente_id"],
@@ -339,13 +343,13 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
         "especialidad":   c_norm["especialidad"],
         "servicio":       c_norm["servicio"],
         "documento":      c_norm.get("hoja_emergencia"),
-        "fecha_consulta": c_norm["fecha_consulta"],
+        "fecha_consulta": fecha_consulta,
         "hora_consulta":  c_norm["hora_consulta"],
         "indicadores":    json_safe(_construir_indicadores(row)),
         "ciclo":          json_safe(_construir_ciclo(row, c_norm)),
         "orden":          None,
-        "creado_en":      row.get("created_at"),
-        "actualizado_en": row.get("updated_at"),
+        "creado_en":      row.get("created_at") or fecha_consulta,  # Fallback a fecha_consulta
+        "actualizado_en": row.get("updated_at") or fecha_consulta,  # Fallback a fecha_consulta
         "activo":         True,
     }
 
