@@ -22,6 +22,10 @@ FIXES aplicados:
   - Bug: telefono_responsable se limpiaba dos veces
   - Bug: expediente fallback "X?" generaba duplicados cuando consulta_id es NULL
   - Bug: reanudación saltaba el TRUNCATE → tablas con datos mixtos
+  - Bug: INSERT_CONSULTA no incluía la columna ultimo_estado → columna siempre NULL
+  - Bug: transformar_consulta leía c_norm.get("status") en lugar del campo
+         "estado_ciclo" ya calculado por normalizar_consulta_completa()
+  - Bug: pacientes_master se ordenaba solo por id, sin respetar orden cronológico
   - Mejora: mapeo_id y mapeo_exp se serializan a disco tras paso 1
   - Mejora: reintento individual cuando falla un lote en paso 2
   - Mejora: verificación de tablas vacías antes de decidir reanudación
@@ -187,15 +191,18 @@ RETURNING id
     bindparam("metadatos",   type_=JSON),
 )
 
+# FIX 1: se agregó ultimo_estado a la lista de columnas y valores del INSERT.
+# Antes esta columna se calculaba en transformar_consulta() pero nunca se
+# incluía en la sentencia SQL, por lo que quedaba siempre NULL en PostgreSQL.
 INSERT_CONSULTA = text("""
 INSERT INTO consultas (
     expediente, paciente_id, tipo_consulta, especialidad, servicio,
     documento, fecha_consulta, hora_consulta, indicadores, ciclo,
-    orden, creado_en, actualizado_en, activo
+    orden, creado_en, actualizado_en, activo, ultimo_estado
 ) VALUES (
     :expediente, :paciente_id, :tipo_consulta, :especialidad, :servicio,
     :documento, :fecha_consulta, :hora_consulta, :indicadores, :ciclo,
-    :orden, :creado_en, :actualizado_en, :activo
+    :orden, :creado_en, :actualizado_en, :activo, :ultimo_estado
 )
 """).bindparams(
     bindparam("indicadores", type_=JSON),
@@ -285,7 +292,7 @@ def transformar_paciente(row: Dict) -> Dict:
         "metadatos":        json_safe(metadatos_json),
         "nombre_completo":  _nombre_completo(row.get("nombre",""), row.get("apellido","")),
         "creado_en":        row.get("created_at"),
-        "actualizado_en":   row.get("update_at")  ,
+        "actualizado_en":   row.get("update_at"),
     }
 
 
@@ -323,7 +330,12 @@ def _construir_ciclo(c: Dict, c_norm: Dict) -> Dict:
         "consulta_por":           c.get("consulta_por"),
         "created_by":             c.get("created_by"),
         "archived_by":            c.get("archived_by"),
-        "estado":                 normalizar_estado_ciclo(c.get("status")),
+        # FIX 2 (parte ciclo): se lee estado_ciclo desde c_norm, que es el campo
+        # calculado por normalizar_consulta_completa() a partir del status entero.
+        # Antes se llamaba de nuevo a normalizar_estado_ciclo(c.get("status")),
+        # lo cual era redundante y podía diferir si c_norm ya había normalizado
+        # el valor. Ahora ambos usan la misma fuente de verdad.
+        "estado":                 c_norm.get("estado_ciclo"),
     }
     return {k: v for k, v in ciclo.items() if v is not None}
 
@@ -332,12 +344,20 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
     c_norm = normalizar_consulta_completa(row)
     if not c_norm:
         return None
-    
-    # Obtener fecha_consulta para usar como fallback
+
     fecha_consulta = c_norm["fecha_consulta"]
-    
+
     return {
         "expediente":     expediente_pg,
+        # FIX 2: se lee "estado_ciclo" desde c_norm en lugar de llamar otra vez
+        # a normalizar_estado_ciclo(c_norm.get("status")).
+        # normalizar_consulta_completa() ya realizó la conversión:
+        #   status MySQL  1  →  "admision"
+        #   status MySQL  2  →  "archivo"
+        #   NULL / otro   →  "recepcion"  (valor por defecto)
+        # El campo en el dict de retorno se llama ultimo_estado para que coincida
+        # con la columna de PostgreSQL (ver INSERT_CONSULTA).
+        "ultimo_estado":  c_norm.get("estado_ciclo"),
         "paciente_id":    row["paciente_id"],
         "tipo_consulta":  c_norm["tipo_consulta"],
         "especialidad":   c_norm["especialidad"],
@@ -348,8 +368,8 @@ def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
         "indicadores":    json_safe(_construir_indicadores(row)),
         "ciclo":          json_safe(_construir_ciclo(row, c_norm)),
         "orden":          None,
-        "creado_en":      row.get("created_at") or fecha_consulta,  # Fallback a fecha_consulta
-        "actualizado_en": row.get("updated_at") or fecha_consulta,  # Fallback a fecha_consulta
+        "creado_en":      row.get("created_at") or fecha_consulta,
+        "actualizado_en": row.get("updated_at") or fecha_consulta,
         "activo":         True,
     }
 
@@ -408,8 +428,14 @@ def paso_1_migrar_pacientes() -> Dict[str, Any]:
         ).scalar()
         info(f"Total pacientes_master: {stats['total']:,}")
 
+        # FIX 3: se agrega ORDER BY created_at ASC, id ASC para que el orden
+        # de inserción en PostgreSQL respete la cronología real de los registros.
+        # Ordenar solo por id no garantiza orden cronológico cuando los ids
+        # provienen de inserciones en lote o con gaps.
+        # El id se usa como desempate secundario para que el orden sea siempre
+        # determinista y reproducible ante timestamps idénticos.
         rows = mysql_db.execute(
-            text("SELECT * FROM pacientes_master ORDER BY id")
+            text("SELECT * FROM pacientes_master ORDER BY created_at ASC, id ASC")
         ).mappings().all()
 
         for i, row in enumerate(rows, 1):
@@ -519,9 +545,7 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
             exp_mysql = str(row["expediente"]) if row.get("expediente") else None
 
             if not exp_mysql:
-                # Fallback seguro: consulta_id siempre existe, nunca NULL
-                fallback_id = row.get("consulta_id") or row.get("id")
-                expediente_pg =  None #f"XCONSULTA{fallback_id}"
+                expediente_pg = None
             else:
                 expediente_pg = mapeo_exp.get(exp_mysql, exp_mysql)
 
@@ -556,7 +580,11 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
 
     return stats
 
-# limpiiar expedientes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIMPIEZA FINAL DE EXPEDIENTES TEMPORALES
+# ─────────────────────────────────────────────────────────────────────────────
+
 def limpieza_final_expedientes():
     titulo("PASO FINAL — LIMPIEZA DE EXPEDIENTES TEMPORALES")
 
@@ -570,7 +598,6 @@ def limpieza_final_expedientes():
         """))
 
         postgres_db.commit()
-
         ok(f"Expedientes temporales limpiados: {result.rowcount:,}")
 
     except Exception as e:
@@ -579,6 +606,7 @@ def limpieza_final_expedientes():
 
     finally:
         postgres_db.close()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VERIFICACIÓN POST-MIGRACIÓN
@@ -617,6 +645,16 @@ def verificar():
             "SELECT COUNT(*) FROM consultas WHERE paciente_id IS NULL"
         )).scalar()
         print(f"\n  Consultas sin paciente_id (PG): {huerfanas:,}")
+
+        print("\n  Distribución por ultimo_estado (PG):")
+        estados = postgres_db.execute(text("""
+            SELECT ultimo_estado, COUNT(*) AS total
+            FROM consultas
+            GROUP BY ultimo_estado
+            ORDER BY total DESC
+        """)).fetchall()
+        for estado, total in estados:
+            print(f"    {(estado or 'NULL'):<25} {total:>10,}")
 
         print("\n  Distribución por criterio de match (desde ciclo JSONB):")
         criterios = postgres_db.execute(text("""
@@ -658,7 +696,6 @@ def main():
     mapeo_guardado = cargar_mapeo() if os.path.exists(MAPEO_FILE) else None
 
     if mapeo_guardado and conteos["pacientes"] > 0:
-        # Hay mapeo Y hay datos en PG → el paso 1 ya corrió anteriormente
         print(f"\n  Se encontró mapeo previo ({len(mapeo_guardado[0]):,} pacientes)")
         print(f"  y PostgreSQL ya tiene {conteos['pacientes']:,} pacientes.")
         print(f"\n  Opciones:")
@@ -668,7 +705,6 @@ def main():
         resp = input("\n  Selección (s/r/n): ").strip().lower()
 
         if resp == "s":
-            # Reanudación: solo paso 2, tablas de PG con datos del paso 1 previo
             titulo("REANUDACIÓN — SOLO PASO 2")
             mapeo_id, mapeo_exp = mapeo_guardado
             r2 = paso_2_migrar_consultas(mapeo_id, mapeo_exp)
@@ -682,14 +718,12 @@ def main():
             return
 
         elif resp == "r":
-            # Reinicio completo — continúa al flujo normal abajo
             print()
         else:
             print("Cancelado.")
             return
 
     elif mapeo_guardado and conteos["pacientes"] == 0:
-        # Hay mapeo pero las tablas están vacías → mapeo inválido, ignorar
         warn(f"Mapeo encontrado pero PostgreSQL está vacío — descartando mapeo.")
         os.remove(MAPEO_FILE)
         mapeo_guardado = None
@@ -707,19 +741,10 @@ def main():
 
     inicio = datetime.now()
 
-    # ── Paso 0: TRUNCATE garantizado antes de cualquier inserción ─────────
     limpiar_tablas_postgres()
-
-    # ── Paso 1: pacientes ─────────────────────────────────────────────────
     r1 = paso_1_migrar_pacientes()
-
-   # ── Paso 2: consultas ─────────────────────────────────────────────────
     r2 = paso_2_migrar_consultas(r1["mapeo_id"], r1["mapeo_exp"])
-
-    # ── Limpieza final ────────────────────────────────────────────────────
     limpieza_final_expedientes()
-
-    # ── Verificación ──────────────────────────────────────────────────────
     verificar()
 
     elapsed = (datetime.now() - inicio).total_seconds()
