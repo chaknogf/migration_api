@@ -5,15 +5,11 @@ MySQL → PostgreSQL
 
 FASE 1 — Preparación en MySQL:
     Crea `citas_master` copiando `citas` + columna `id_paciente` resuelta
-    en cascada desde `pacientes_master`:
-        Nivel 1: citas.expediente = pacientes_master.expediente
-        Nivel 2: citas.expediente = pacientes_master.exp_migrado  (VARCHAR)
-        Nivel 3: citas.expediente = pacientes_master.exp_ref      (INT)
-    Las citas sin vínculo quedan fuera; se reportan en citas_sin_paciente.csv
+    en cascada desde `pacientes_master`.
 
 FASE 2 — Migración MySQL → PostgreSQL:
-    Lee citas_master (paciente_id ya resuelto), transforma e inserta en PG.
-    No hay omisiones por expediente; solo pueden ocurrir errores de inserción.
+    Lee citas_master, traduce id_paciente de MySQL → PG usando
+    mapeo_migracion.json generado por migrar_postgres.py, e inserta en PG.
 
 Columnas origen (MySQL citas_master):
     id, fecha, expediente, especialidad (int), fecha_cita,
@@ -24,6 +20,10 @@ Columnas destino (PostgreSQL citas):
     id (identity), fecha_registro, paciente_id, especialidad (VARCHAR 6),
     fecha_cita, expediente (VARCHAR 20), datos_extra (JSONB),
     created_at, updated_at, created_by
+
+Mapeo de fechas:
+    fecha      (MySQL) → fecha_cita      (PG) — cuándo está agendada la cita
+    fecha_cita (MySQL) → fecha_registro  (PG) — cuándo se creó el registro
 """
 
 import os
@@ -44,13 +44,13 @@ load_dotenv()
 # CONFIGURACIÓN
 # ============================================================================
 
-BATCH_SIZE      = 500
-LOG_INTERVAL    = 5_000
-CHECKPOINT_FILE = Path("checkpoint_citas.txt")
-ERROR_FILE      = Path("citas_errores.csv")
+BATCH_SIZE        = 500
+LOG_INTERVAL      = 5_000
+CHECKPOINT_FILE   = Path("checkpoint_citas.txt")
+ERROR_FILE        = Path("citas_errores.csv")
 SIN_PACIENTE_FILE = Path("citas_sin_paciente.csv")
+MAPEO_FILE        = Path("mapeo_migracion.json")
 
-# Mapeo especialidad numérica (MySQL int) → código (PostgreSQL VARCHAR 6)
 ESPECIALIDADES_MAP: dict[int, str] = {
     1: "MEDI",   # Medicina Interna
     2: "PEDI",   # Pediatría
@@ -62,7 +62,6 @@ ESPECIALIDADES_MAP: dict[int, str] = {
     8: "ODON",   # Odontología
 }
 
-# Mapeo tipo (MySQL int) → razon_consulta
 RAZON_CONSULTA_MAP: dict[int, str] = {
     0: "control",
     1: "control",
@@ -94,9 +93,10 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Stats:
-    migradas:     int = 0
-    errores:      int = 0
-    sin_paciente: int = 0
+    migradas:       int = 0
+    errores:        int = 0
+    sin_paciente:   int = 0
+    sin_mapeo:      int = 0   # id_paciente MySQL sin entrada en mapeo_migracion.json
     inicio: datetime = field(default_factory=datetime.now)
 
     def resumen(self) -> str:
@@ -106,6 +106,7 @@ class Stats:
             f"\n{'='*60}\n"
             f"  ✅  Migradas        : {self.migradas:>10,}\n"
             f"  👻  Sin paciente    : {self.sin_paciente:>10,}\n"
+            f"  🗺   Sin mapeo PG   : {self.sin_mapeo:>10,}\n"
             f"  ❌  Errores        : {self.errores:>10,}\n"
             f"  ⏱   Tiempo         : {elapsed:>10.1f} s\n"
             f"  🚀  Velocidad      : {rate:>10.0f} filas/s\n"
@@ -141,6 +142,28 @@ def crear_motores():
     pg_engine    = create_engine(_url_postgres(), echo=False, pool_pre_ping=True,
                                  pool_size=2, max_overflow=2)
     return mysql_engine, pg_engine
+
+# ============================================================================
+# MAPEO DE PACIENTES  mysql_id → pg_id
+# ============================================================================
+
+def cargar_mapeo_pacientes() -> dict[int, int]:
+    """
+    Carga mapeo_migracion.json generado por migrar_postgres.py.
+    Retorna {mysql_id: pg_id} para traducir id_paciente antes de insertar.
+    Sin este mapeo las citas quedarían con el ID de MySQL en paciente_id,
+    apuntando al paciente equivocado en PostgreSQL.
+    """
+    if not MAPEO_FILE.exists():
+        raise FileNotFoundError(
+            f"No se encontró {MAPEO_FILE}. "
+            "Ejecuta primero migrar_postgres.py para generar el mapeo de pacientes."
+        )
+    with open(MAPEO_FILE, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    mapeo = {int(k): v for k, v in payload["mapeo_id"].items()}
+    log.info("🗺   Mapeo cargado: %d pacientes (mysql_id → pg_id)", len(mapeo))
+    return mapeo
 
 # ============================================================================
 # CHECKPOINT
@@ -191,23 +214,15 @@ class CsvWriter:
 # ============================================================================
 
 SQL_CREAR_CITAS_MASTER = """
--- ─────────────────────────────────────────────────────────────
--- PASO 0: limpiar ejecuciones anteriores
--- ─────────────────────────────────────────────────────────────
 DROP TABLE IF EXISTS citas_master;
 
--- ─────────────────────────────────────────────────────────────
--- PASO 1: crear tabla con misma estructura + id_paciente
--- ─────────────────────────────────────────────────────────────
 CREATE TABLE citas_master LIKE citas;
 ALTER TABLE citas_master
     ADD COLUMN id_paciente INT NOT NULL COMMENT 'FK resuelta a pacientes_master.id',
     ADD COLUMN nivel_match TINYINT NOT NULL DEFAULT 0
         COMMENT '1=expediente directo, 2=exp_migrado, 3=exp_ref';
 
--- ─────────────────────────────────────────────────────────────
 -- NIVEL 1: expediente directo
--- ─────────────────────────────────────────────────────────────
 INSERT INTO citas_master
 SELECT
     c.*,
@@ -220,9 +235,7 @@ INNER JOIN pacientes_master p
 WHERE c.especialidad IS NOT NULL
   AND c.especialidad != 0;
 
--- ─────────────────────────────────────────────────────────────
--- NIVEL 2: exp_migrado (VARCHAR, puede contener varios separados por coma)
--- ─────────────────────────────────────────────────────────────
+-- NIVEL 2: exp_migrado
 INSERT INTO citas_master
 SELECT
     c.*,
@@ -233,15 +246,14 @@ INNER JOIN pacientes_master p
     ON c.expediente IS NOT NULL
     AND p.exp_migrado IS NOT NULL
     AND p.exp_migrado != ''
-    AND FIND_IN_SET(CONVERT(CAST(c.expediente AS CHAR) USING utf8mb4) COLLATE utf8mb4_unicode_ci, CONVERT(p.exp_migrado USING utf8mb4) COLLATE utf8mb4_unicode_ci) > 0
+    AND FIND_IN_SET(CONVERT(CAST(c.expediente AS CHAR) USING utf8mb4) COLLATE utf8mb4_unicode_ci,
+                   CONVERT(p.exp_migrado USING utf8mb4) COLLATE utf8mb4_unicode_ci) > 0
 LEFT JOIN citas_master cm ON c.id = cm.id
 WHERE cm.id IS NULL
   AND c.especialidad IS NOT NULL
   AND c.especialidad != 0;
 
--- ─────────────────────────────────────────────────────────────
--- NIVEL 3: exp_ref (INT)
--- ─────────────────────────────────────────────────────────────
+-- NIVEL 3: exp_ref
 INSERT INTO citas_master
 SELECT
     c.*,
@@ -257,9 +269,6 @@ WHERE cm.id IS NULL
   AND c.especialidad IS NOT NULL
   AND c.especialidad != 0;
 
--- ─────────────────────────────────────────────────────────────
--- ÍNDICE para acelerar la migración por lotes (checkpoint)
--- ─────────────────────────────────────────────────────────────
 ALTER TABLE citas_master ADD INDEX idx_id (id);
 """
 
@@ -276,9 +285,7 @@ ORDER BY c.id;
 """
 
 SQL_RESUMEN_NIVELES = """
-SELECT
-    nivel_match,
-    COUNT(*) AS total
+SELECT nivel_match, COUNT(*) AS total
 FROM citas_master
 GROUP BY nivel_match
 ORDER BY nivel_match;
@@ -295,9 +302,8 @@ def preparar_citas_master(mysql_eng, stats: Stats, sin_pac_writer: CsvWriter) ->
         ddl_conn.commit()
 
     with mysql_eng.connect() as audit_conn:
-        niveles = audit_conn.execute(text(SQL_RESUMEN_NIVELES))
-        total   = 0
-        for r in niveles:
+        total = 0
+        for r in audit_conn.execute(text(SQL_RESUMEN_NIVELES)):
             label = {1: "expediente directo", 2: "exp_migrado", 3: "exp_ref"}.get(r[0], "?")
             log.info("   Nivel %d (%s): %d citas", r[0], label, r[1])
             total += r[1]
@@ -326,7 +332,6 @@ def preparar_citas_master(mysql_eng, stats: Stats, sin_pac_writer: CsvWriter) ->
 # ============================================================================
 
 def _safe_date(val):
-    """datetime → date; None si nulo."""
     if val is None:
         return None
     if isinstance(val, datetime):
@@ -358,22 +363,32 @@ def _construir_datos_extra(raw: dict) -> str | None:
     return json.dumps(extras, default=str) if extras else None
 
 
-def transformar_cita(raw: dict) -> dict:
+def transformar_cita(raw: dict, mapeo_pacientes: dict[int, int]) -> dict | None:
     """
-    Mapeo correcto:
+    Mapeo de fechas:
         fecha      (MySQL) → fecha_cita      (PG) — cuándo está agendada la cita
         fecha_cita (MySQL) → fecha_registro  (PG) — cuándo se creó el registro
+
+    Mapeo de IDs:
+        id_paciente (MySQL) → traducido a pg_id via mapeo_migracion.json
+        Si no existe en el mapeo, retorna None (la cita se omite y se cuenta).
     """
     now = datetime.now()
+
+    # Traducir id_paciente de MySQL → PostgreSQL
+    mysql_paciente_id = raw["id_paciente"]
+    pg_paciente_id    = mapeo_pacientes.get(mysql_paciente_id)
+    if pg_paciente_id is None:
+        return None  # señal para contar como sin_mapeo y omitir
 
     esp_raw      = raw.get("especialidad")
     especialidad = ESPECIALIDADES_MAP.get(int(esp_raw)) if esp_raw is not None else None
 
     return {
-        "fecha_registro": _safe_date(raw.get("fecha_cita")),   # fecha de creación del registro
-        "paciente_id":    raw["id_paciente"],
+        "fecha_registro": _safe_date(raw.get("fecha_cita")),  # creación del registro
+        "paciente_id":    pg_paciente_id,                      # ID correcto en PostgreSQL ← FIX
         "especialidad":   especialidad,
-        "fecha_cita":     _safe_date(raw.get("fecha")),        # fecha real de la cita ← CORREGIDO
+        "fecha_cita":     _safe_date(raw.get("fecha")),        # fecha agendada de la cita
         "expediente":     str(raw["expediente"]).strip() if raw.get("expediente") is not None else None,
         "datos_extra":    _construir_datos_extra(raw),
         "created_at":     raw.get("created_at") or now,
@@ -399,7 +414,6 @@ INSERT_CITA = text("""
 
 
 def insertar_lote(pg_conn, lote: list[dict], stats: Stats, err_writer: CsvWriter) -> None:
-    """Intenta lote completo; si falla, reintenta fila a fila."""
     try:
         pg_conn.execute(INSERT_CITA, lote)
         pg_conn.commit()
@@ -422,7 +436,6 @@ def insertar_lote(pg_conn, lote: list[dict], stats: Stats, err_writer: CsvWriter
 # ============================================================================
 
 def limpiar_tabla_citas(pg_conn) -> None:
-    """Vacía la tabla citas y reinicia el serial (identity) desde 1."""
     log.info("🗑   Vaciando tabla citas y reiniciando secuencia...")
     pg_conn.execute(text("TRUNCATE TABLE citas RESTART IDENTITY CASCADE"))
     pg_conn.commit()
@@ -432,22 +445,21 @@ def limpiar_tabla_citas(pg_conn) -> None:
 # DIAGNÓSTICO
 # ============================================================================
 
-def diagnosticar(mysql_conn) -> None:
-    """Muestra una muestra de citas_master para verificar el pre-vínculo."""
+def diagnosticar(mysql_conn, mapeo_pacientes: dict[int, int]) -> None:
     log.info("─" * 60)
-    log.info("🔬  DIAGNÓSTICO — muestra citas_master")
+    log.info("🔬  DIAGNÓSTICO — muestra citas_master (con traducción de IDs)")
     sample = mysql_conn.execute(text(
         "SELECT id, expediente, id_paciente, nivel_match, especialidad, tipo, "
-        "fecha, fecha_cita "
-        "FROM citas_master LIMIT 5"
+        "fecha, fecha_cita FROM citas_master LIMIT 5"
     ))
     for r in sample:
-        esp   = ESPECIALIDADES_MAP.get(r[4]) if r[4] is not None else None
-        razon = RAZON_CONSULTA_MAP.get(r[5]) if r[5] is not None else None
+        esp         = ESPECIALIDADES_MAP.get(r[4]) if r[4] is not None else None
+        razon       = RAZON_CONSULTA_MAP.get(r[5]) if r[5] is not None else None
         nivel_label = {1: "directo", 2: "exp_migrado", 3: "exp_ref"}.get(r[3], "?")
+        pg_id       = mapeo_pacientes.get(r[2], "⚠️ SIN MAPEO")
         log.info(
-            "   id=%-6s  exp=%-8s  paciente_id=%-6s  nivel=%s(%s)  esp=%s  razon=%s  fecha=%s  fecha_cita=%s",
-            r[0], r[1], r[2], r[3], nivel_label, esp, razon, r[6], r[7],
+            "   id=%-6s  exp=%-8s  mysql_pac=%-6s  pg_pac=%-6s  nivel=%s(%s)  esp=%s  razon=%s  fecha=%s  fecha_cita=%s",
+            r[0], r[1], r[2], pg_id, r[3], nivel_label, esp, razon, r[6], r[7],
         )
     log.info("─" * 60)
 
@@ -460,7 +472,10 @@ def migrar_citas(reanudar: bool = False) -> Stats:
     log.info("📅  MIGRACIÓN DE CITAS  MySQL → PostgreSQL")
     log.info("=" * 60)
 
-    stats        = Stats()
+    # Cargar mapeo ANTES de conectar a las BDs — falla rápido si no existe
+    mapeo_pacientes = cargar_mapeo_pacientes()
+
+    stats         = Stats()
     mysql_eng, pg_eng = crear_motores()
 
     sin_pac_writer = CsvWriter(
@@ -482,19 +497,17 @@ def migrar_citas(reanudar: bool = False) -> Stats:
 
             mysql_conn = mysql_conn.execution_options(stream_results=True)
 
-            # ── FASE 1: preparar citas_master (solo en migración fresca) ──
             if not reanudar:
                 preparar_citas_master(mysql_eng, stats, sin_pac_writer)
                 limpiar_tabla_citas(pg_conn)
 
-            # ── FASE 2: migrar ──
             total = mysql_conn.execute(
                 text("SELECT COUNT(*) FROM citas_master WHERE id > :u"),
                 {"u": ultimo_id_ok},
             ).scalar()
             log.info("📊  Citas en citas_master a procesar: %d", total)
 
-            diagnosticar(mysql_conn)
+            diagnosticar(mysql_conn, mapeo_pacientes)
 
             resultado = mysql_conn.execute(
                 text("SELECT * FROM citas_master WHERE id > :u ORDER BY id"),
@@ -507,7 +520,19 @@ def migrar_citas(reanudar: bool = False) -> Stats:
             for row in resultado:
                 raw = dict(row._mapping)
 
-                lote.append(transformar_cita(raw))
+                transformada = transformar_cita(raw, mapeo_pacientes)
+                if transformada is None:
+                    # id_paciente de MySQL no tiene entrada en el mapeo de PG
+                    stats.sin_mapeo += 1
+                    if stats.sin_mapeo <= 5:
+                        log.warning(
+                            "   ⚠️  Sin mapeo PG: cita_id=%s  mysql_paciente_id=%s  expediente=%s",
+                            raw["id"], raw["id_paciente"], raw.get("expediente"),
+                        )
+                    ultimo_id = raw["id"]
+                    continue
+
+                lote.append(transformada)
                 stats.migradas += 1
                 ultimo_id = raw["id"]
 
@@ -516,8 +541,8 @@ def migrar_citas(reanudar: bool = False) -> Stats:
                     guardar_checkpoint(ultimo_id)
                     lote = []
                     if stats.migradas % LOG_INTERVAL == 0:
-                        log.info("   → %d migradas | %d errores",
-                                 stats.migradas, stats.errores)
+                        log.info("   → %d migradas | %d errores | %d sin mapeo",
+                                 stats.migradas, stats.errores, stats.sin_mapeo)
 
             if lote:
                 insertar_lote(pg_conn, lote, stats, error_writer)
