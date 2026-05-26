@@ -54,6 +54,8 @@ ESPECIALIDADES = {
 COLEGIADOS_VISTOS: set = set()
 DPIS_VISTOS: set = set()
 
+_SKIP = object()  # Sentinel para indicar "omitir registro"
+
 
 def normalizar_nombre(name: Any) -> str:
     """Limpia y capitaliza el nombre del médico."""
@@ -63,9 +65,10 @@ def normalizar_nombre(name: Any) -> str:
     return " ".join(str(name).strip().title().split())
 
 
-def normalizar_colegiado(colegiado: Any, id_mysql: Any) -> Optional[str]:
+def normalizar_colegiado(colegiado: Any, id_mysql: Any):
     """
     Convierte el colegiado int de MySQL a varchar(20) de PostgreSQL.
+    Retorna _SKIP si el colegiado ya existe (duplicado).
     """
 
     if not colegiado:
@@ -77,15 +80,11 @@ def normalizar_colegiado(colegiado: Any, id_mysql: Any) -> Optional[str]:
         col_str = str(colegiado).strip()
 
     if col_str in COLEGIADOS_VISTOS:
-        col_nuevo = f"{col_str}-DUP-{id_mysql}"
-
         print(
-            f"   ⚠️ Colegiado duplicado: "
-            f"'{col_str}' → '{col_nuevo}'"
+            f"   ⚠️ Colegiado duplicado: '{col_str}' "
+            f"(id={id_mysql}) → registro omitido"
         )
-
-        COLEGIADOS_VISTOS.add(col_nuevo)
-        return col_nuevo
+        return _SKIP
 
     COLEGIADOS_VISTOS.add(col_str)
 
@@ -171,9 +170,10 @@ def normalizar_especialidad(
 # TRANSFORMACIÓN PRINCIPAL
 # ============================================================================
 
-def transformar_medico(row: Any) -> tuple[dict, list[str]]:
+def transformar_medico(row: Any) -> tuple[Optional[dict], list[str]]:
     """
     Transforma un registro de MySQL a PostgreSQL.
+    Retorna (None, advertencias) si el registro debe omitirse.
     """
 
     advertencias = []
@@ -188,10 +188,10 @@ def transformar_medico(row: Any) -> tuple[dict, list[str]]:
     if nombre == "SIN NOMBRE":
         advertencias.append(f"[id={id_mysql}] sin nombre")
 
-    colegiado = normalizar_colegiado(
-        row.get("colegiado"),
-        id_mysql
-    )
+    colegiado = normalizar_colegiado(row.get("colegiado"), id_mysql)
+
+    if colegiado is _SKIP:
+        return None, [f"[id={id_mysql}] colegiado duplicado → omitido"]
 
     if colegiado is None:
         advertencias.append(f"[id={id_mysql}] sin colegiado")
@@ -358,6 +358,7 @@ def migrar_medicos(batch_size: int = 200) -> dict:
     stats = {
         "total": 0,
         "exitosos": 0,
+        "omitidos": 0,
         "errores": 0,
         "advertencias": [],
     }
@@ -388,6 +389,11 @@ def migrar_medicos(batch_size: int = 200) -> dict:
 
                     for adv in advertencias:
                         print(f"   ⚠️ {adv}")
+
+                # Registro omitido (colegiado duplicado u otra razón)
+                if registro is None:
+                    stats["omitidos"] += 1
+                    continue
 
                 batch.append(registro)
 
@@ -585,6 +591,7 @@ def main():
 
     print(f"Total procesados:    {stats['total']:,}")
     print(f"Migrados exitosos:   {stats['exitosos']:,}")
+    print(f"Omitidos:            {stats['omitidos']:,}")
     print(f"Errores:             {stats['errores']:,}")
 
     print(
