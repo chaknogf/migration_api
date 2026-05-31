@@ -15,31 +15,35 @@ echo "📂 Entrando al proyecto..."
 cd "$PROJECT_DIR"
 
 echo ""
-echo "[1/7] Restaurando MySQL..."
+echo "[1/8] Restaurando MySQL..."
 ./restaurar_mysql.sh
 
 echo ""
-echo "[2/7] Activando entorno virtual..."
+echo "[2/8] Activando entorno virtual..."
 source .venv/bin/activate
 
 echo ""
-echo "[3/7] Preparando datos MySQL..."
+echo "[3/8] Preparando datos MySQL..."
 python3 preparar_mysql_optimizado.py
 
 echo ""
-echo "[4/7] Migrando médicos..."
+echo "[4/8] Migrando médicos..."
 python3 migrate_medicos.py
 
 echo ""
-echo "[5/7] Migrando pacientes y consultas..."
+echo "[5/8] Migrando procedimientos..."
+python3 migrate_procedimientos.py
+
+echo ""
+echo "[6/8] Migrando pacientes y consultas..."
 python3 migrar_postgres.py
 
 echo ""
-echo "[6/7] Migrando citas..."
+echo "[7/8] Migrando citas..."
 python3 migrate_citas.py
 
 echo ""
-echo "[7/7] Generando y enviando backup PostgreSQL..."
+echo "[8/8] Generando y enviando backup PostgreSQL..."
 python3 backup_postgres.py
 
 echo ""
