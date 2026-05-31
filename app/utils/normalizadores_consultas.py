@@ -69,46 +69,67 @@ def normalizar_especialidad(especialidad: Optional[int]) -> Optional[str]:
         return None
 
 
-def normalizar_servicio(servicio: Optional[int]) -> Optional[str]:
+def normalizar_servicio(
+    servicio: Optional[int],
+    tipo_consulta: Optional[int] = None,
+    sexo: Optional[str] = None,          # 'M', 'F', o None
+) -> str:
     """
-    Normaliza servicio hospitalario.
-    Convierte código numérico a nombre de servicio.
-    Retorna None si el valor es inválido (para usar default después).
+    Normaliza servicio hospitalario cruzando tipo_consulta + valor numérico + sexo.
+
+    Reglas:
+      tipo_consulta = 1  → siempre 'COEX'
+      tipo_consulta = 3  → siempre 'EMER'
+      tipo_consulta = 2  → HOSP_MAP; los valores 4/5/6/7 se bifurcan por sexo:
+                           M → CIHO / TRHO
+                           F → CIMU / TRMU
+                           None → CIHO / TRHO  (fallback masculino como genérico)
     """
+    try:
+        tc = int(tipo_consulta) if tipo_consulta is not None else None
+    except (ValueError, TypeError):
+        tc = None
+
+    if tc == 1:
+        return "COEX"
+    if tc == 3:
+        return "EMER"
+
+    # Normalizar sexo para la bifurcación
+    es_mujer = str(sexo).strip().upper() == "F" if sexo else False
+
+    HOSP_MAP = {
+        0:  "EMER",
+        1:  "SOPR",
+        2:  "MATE",
+        3:  "GINI",
+        4:  "CIMU" if es_mujer else "CIHO",   # Cirugía  ← bifurca por sexo
+        5:  "CIMU" if es_mujer else "CIHO",   # Cirugía pedia  ← ídem
+        6:  "TRMU" if es_mujer else "TRHO",   # Trauma  ← bifurca por sexo
+        7:  "TRMU" if es_mujer else "TRHO",   # Trauma pedia  ← ídem
+        8:  "CRN_",
+        9:  "PEDA",
+        10: "NEON",
+        11: "NEON",
+        12: "MEHO",
+        13: "MEMU",
+        14: "OTRO",   # VSVS — sin equivalente
+        15: "OTRO",   # COVID — disuelto
+        16: "MATE",   # Labor & parto
+        17: "AROJ",
+        18: "MEDI",
+        19: "UCIN",
+        20: "COEX",
+        21: "EMER",
+    }
+
     if servicio is None:
-        return None
+        return "OTRO"
 
     try:
-        serv_int = int(servicio)
-
-        SERVICIOS_MAP = {
-            0:  "NO_ESP",
-            1:  "SOP",
-            2:  "MATERNIDAD",
-            3:  "GINECOLOGIA",
-            4:  "CIRUGIA",
-            5:  "CIRUGIA PEDIA",
-            6:  "TRAUMATOLOGIA",
-            7:  "TRAUMA PEDIA",
-            8:  "CRN",
-            9:  "PEDIATRIA",
-            10: "ALOJ CONJUNTO",
-            11: "NEONATOS",
-            12: "MEDICINA HOMBRES",
-            13: "MEDICINA MUJERES",
-            14: "VSVS",
-            15: "COVID",
-            16: "LABOR Y PARTO",
-            17: "AREA ROJA",
-            18: "UCIN",
-            -1: "NO_ESP",
-        }
-
-        return SERVICIOS_MAP.get(serv_int, "NO_ESP")
+        return HOSP_MAP.get(int(servicio), "OTRO")
     except (ValueError, TypeError):
-        return None
-
-
+        return "OTRO"
 def normalizar_hoja_emergencia(hoja: Optional[str]) -> Optional[str]:
     """Normaliza número de hoja de emergencia."""
     if not hoja:
@@ -318,7 +339,10 @@ def validar_consulta_completa(consulta: Dict) -> tuple[bool, str]:
 # FUNCIÓN PRINCIPAL DE NORMALIZACIÓN DE CONSULTA
 # ============================================================================
 
-def normalizar_consulta_completa(consulta_raw: Dict) -> Optional[Dict]:
+def normalizar_consulta_completa(
+    consulta_raw: Dict,
+    sexo: Optional[str] = None,    # nuevo parámetro
+) -> Optional[Dict]:
     """
     Normaliza todos los campos de una consulta.
     Usa valores por defecto para campos faltantes.
@@ -346,9 +370,12 @@ def normalizar_consulta_completa(consulta_raw: Dict) -> Optional[Dict]:
     if especialidad is None:
         especialidad = ESPECIALIDAD_DEFAULT
 
-    servicio = normalizar_servicio(consulta_raw.get("servicio"))
-    if servicio is None:
-        servicio = SERVICIO_DEFAULT
+    servicio = normalizar_servicio(
+        consulta_raw.get("servicio"),
+        tipo_consulta,
+        sexo,
+    )
+
 
     hora = normalizar_hora_consulta(consulta_raw.get("hora"))
     if hora is None:

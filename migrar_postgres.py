@@ -340,8 +340,12 @@ def _construir_ciclo(c: Dict, c_norm: Dict) -> Dict:
     return {k: v for k, v in ciclo.items() if v is not None}
 
 
-def transformar_consulta(row: Dict, expediente_pg: str) -> Optional[Dict]:
-    c_norm = normalizar_consulta_completa(row)
+def transformar_consulta(
+    row: Dict,
+    expediente_pg: str,
+    sexo: Optional[str] = None,    # nuevo parámetro
+) -> Optional[Dict]:
+    c_norm = normalizar_consulta_completa(row, sexo=sexo)   # lo pasa aquí
     if not c_norm:
         return None
 
@@ -384,29 +388,48 @@ def limpiar_tablas_postgres() -> None:
     titulo("PASO 0 — LIMPIAR TABLAS POSTGRESQL")
 
     postgres_db = PostgresSession()
-    # Orden inverso a la FK: primero consultas (hija), luego pacientes (padre)
-    TABLAS = ["consultas", "pacientes"]
+
+    TABLAS = [
+        "constancia_medica_control",
+        "constancia_nacimiento_control",
+        "constancia_nacimiento_historial",
+        "defuncion_control",
+        "emergencia_control",
+        "expediente_control",
+        "consultas",
+        "pacientes",
+    ]
 
     try:
         for tabla in TABLAS:
-            n_antes = postgres_db.execute(text(f"SELECT COUNT(*) FROM {tabla}")).scalar()
+            n_antes = postgres_db.execute(
+                text(f"SELECT COUNT(*) FROM {tabla}")
+            ).scalar()
+
             info(f"Truncando {tabla} ({n_antes:,} registros existentes)...")
-            postgres_db.execute(text(f"TRUNCATE TABLE {tabla} RESTART IDENTITY CASCADE"))
+
+            postgres_db.execute(
+                text(f"TRUNCATE TABLE {tabla} RESTART IDENTITY CASCADE")
+            )
 
         postgres_db.commit()
         ok("Tablas limpiadas — secuencias reiniciadas")
 
     except Exception as e:
         postgres_db.rollback()
-        raise RuntimeError(f"Error limpiando tablas PostgreSQL: {e}") from e
+        raise RuntimeError(
+            f"Error limpiando tablas PostgreSQL: {e}"
+        ) from e
+
     finally:
         postgres_db.close()
 
-    # Eliminar el mapeo anterior: ya no es válido con las tablas truncadas
     if os.path.exists(MAPEO_FILE):
         os.remove(MAPEO_FILE)
-        info(f"Mapeo anterior eliminado: {MAPEO_FILE} (tablas truncadas → mapeo inválido)")
-
+        info(
+            f"Mapeo anterior eliminado: {MAPEO_FILE} "
+            "(tablas truncadas → mapeo inválido)"
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PASO 1 — MIGRAR pacientes_master → pacientes (PostgreSQL)
@@ -508,18 +531,30 @@ def _flush_batch_con_reintento(
                     warn(f"  Error consulta id_mysql={consulta.get('ciclo', {}).get('id_mysql','?')}: {e_fila}")
 
 
-def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str]) -> Dict:
+def paso_2_migrar_consultas(
+    mapeo_id: Dict[int, int],
+    mapeo_exp: Dict[str, str],
+) -> Dict:
     titulo("PASO 2 — MIGRAR consultas_master → PostgreSQL")
 
     mysql_db    = MySQLSession()
     postgres_db = PostgresSession()
 
-    stats = {
-        "ok": 0, "error": 0, "sin_fecha": 0,
-        "sin_paciente": 0, "total": 0,
-    }
+    stats = {"ok": 0, "error": 0, "sin_fecha": 0, "sin_paciente": 0, "total": 0}
 
     try:
+        # ── Pre-cargar sexo de todos los pacientes en un solo query ───────
+        # Evita N queries adicionales dentro del loop principal.
+        info("Cargando sexo de pacientes...")
+        sexo_rows = mysql_db.execute(
+            text("SELECT id, sexo FROM pacientes_master")
+        ).mappings().all()
+        mapeo_sexo: Dict[int, Optional[str]] = {
+            r["id"]: r["sexo"] for r in sexo_rows
+        }
+        ok(f"Sexo cargado: {len(mapeo_sexo):,} pacientes")
+
+        # ── Conteo y carga de consultas ───────────────────────────────────
         stats["total"] = mysql_db.execute(
             text("SELECT COUNT(*) FROM consultas_master")
         ).scalar()
@@ -543,14 +578,13 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
 
             # ── Resolver expediente en PostgreSQL ─────────────────────────
             exp_mysql = str(row["expediente"]) if row.get("expediente") else None
+            expediente_pg = mapeo_exp.get(exp_mysql, exp_mysql) if exp_mysql else None
 
-            if not exp_mysql:
-                expediente_pg = None
-            else:
-                expediente_pg = mapeo_exp.get(exp_mysql, exp_mysql)
+            # ── Resolver sexo del paciente dueño de esta consulta ─────────
+            sexo_paciente = mapeo_sexo.get(row.get("paciente_id"))
 
             # ── Transformar ───────────────────────────────────────────────
-            consulta_pg = transformar_consulta(dict(row), expediente_pg)
+            consulta_pg = transformar_consulta(dict(row), expediente_pg, sexo_paciente)
 
             if not consulta_pg:
                 stats["sin_fecha"] += 1
@@ -579,8 +613,6 @@ def paso_2_migrar_consultas(mapeo_id: Dict[int, int], mapeo_exp: Dict[str, str])
         postgres_db.close()
 
     return stats
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # LIMPIEZA FINAL DE EXPEDIENTES TEMPORALES
 # ─────────────────────────────────────────────────────────────────────────────
