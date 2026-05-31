@@ -29,6 +29,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================================
+# MAPEOS DE VALORES (MySQL → PostgreSQL)
+# ============================================================================
+
+# Mapeo de servicios (MySQL value → PostgreSQL label)
+# Según la tabla proporcionada:
+# 1 → 'COEX' (COEX)
+# 2 → 'Encamamiento' (HOSP)
+# 3 → 'Emergencia' (EMER)
+# 4 → 'SOP emergencia' (SOEM)
+# 5 → 'SOP electiva' (SOEL)
+# 6 → 'Maternidad' (HOSP)
+SERVICIOS_MAP = {
+    1: 'COEX',
+    2: 'HOSP',
+    3: 'EMER',
+    4: 'SOPEM',
+    5: 'SOPEL',
+    6: 'HOSP',
+}
+
+# Mapeo de especialidades (MySQL value → PostgreSQL label)
+# 1 → 'Medicina Interna'
+# 2 → 'Pediatria'
+# 3 → 'Ginecologia y Obstetricia'
+# 4 → 'Cirugia'
+# 5 → 'Traumatologia'
+# 6 → 'Traumatologia' (mapeo adicional)
+ESPECIALIDADES_MAP = {
+    1: 'MEDI',
+    2: 'PEDI',
+    3: 'GINE',
+    4: 'CIRU',
+    5: 'TRAU',
+    6: 'TRAU',  # Valor 6 también mapea a Traumatologia
+}
+
+# ============================================================================
 # CATÁLOGO DE PROCEDIMIENTOS
 # Espejo exacto de migration_api/sql/procedimientos.sql
 # (abreviatura, nombre, descripcion, anestesia)
@@ -526,6 +563,31 @@ def mysql_crear_master(mapa: dict[str, int], batch_size: int = 500) -> dict:
 
 
 # ============================================================================
+# FUNCIÓN AUXILIAR PARA MAPEO DE VALORES
+# ============================================================================
+
+def mapear_servicio(valor):
+    """Mapea valor numérico de servicio a su label en PostgreSQL"""
+    if valor is None:
+        return None
+    try:
+        valor_int = int(valor)
+        return SERVICIOS_MAP.get(valor_int, None)
+    except (ValueError, TypeError):
+        return None
+
+def mapear_especialidad(valor):
+    """Mapea valor numérico de especialidad a su label en PostgreSQL"""
+    if valor is None:
+        return None
+    try:
+        valor_int = int(valor)
+        return ESPECIALIDADES_MAP.get(valor_int, None)
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================================
 # FASE 2-A — Migrar procedimientos MySQL → PostgreSQL
 # ============================================================================
 
@@ -600,34 +662,38 @@ def pg_migrar_procedimientos():
 
 
 # ============================================================================
-# FASE 2-B — Migrar proce_medicos_master MySQL → PostgreSQL
+# FASE 2-B — Migrar proce_medicos_master MySQL → PostgreSQL (CON MAPEO)
 # ============================================================================
 
 def pg_migrar_proce_medicos(batch_size: int = 500) -> dict:
     mysql_db = MySQLSession()
     pg_db    = PostgresSession()
 
-    stats = {"total": 0, "exitosos": 0, "errores": 0}
+    stats = {"total": 0, "exitosos": 0, "errores": 0, "mapeos_servicio": {}, "mapeos_especialidad": {}}
 
     try:
         print("=" * 80)
         print("🚀 FASE 2-B: MIGRAR proce_medicos_master → PostgreSQL")
         print("=" * 80)
+        print("   🔄 Aplicando mapeos:")
+        print("      • servicio (INT) → lugar_servicio (VARCHAR)")
+        print("      • especialidad (INT) → especialidad (VARCHAR)")
+        print("=" * 80)
 
         # CREATE en PostgreSQL (procedimientos ya existe)
+        # NOTA: La columna 'servicio' se renombra a 'lugar_servicio'
         pg_db.execute(text("""
             CREATE TABLE proce_medicos (
                 id               SERIAL    PRIMARY KEY,
                 fecha            DATE,
-                servicio         INT,
+                lugar_servicio   VARCHAR(10),  -- Antes: servicio (INT)
                 sexo             CHAR(1)   CHECK (sexo IN ('M', 'F')),
                 id_procedimiento INT       REFERENCES procedimientos(id)
                                                ON DELETE SET NULL,
-                especialidad     INT,
+                especialidad     VARCHAR(10),  -- Antes: especialidad (INT)
                 cantidad         INT       NOT NULL DEFAULT 1
                                                CHECK (cantidad >= 1),
-                medico           INT       REFERENCES medicos(id)
-                                               ON DELETE SET NULL,
+                responsable      VARCHAR(10),     
                 anestesia        INT       DEFAULT 0,
                 created_by       VARCHAR(10),
                 created_at       TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -635,9 +701,9 @@ def pg_migrar_proce_medicos(batch_size: int = 500) -> dict:
             )
         """))
         pg_db.execute(text("CREATE INDEX idx_pm_fecha    ON proce_medicos (fecha)"))
-        pg_db.execute(text("CREATE INDEX idx_pm_medico   ON proce_medicos (medico)"))
         pg_db.execute(text("CREATE INDEX idx_pm_proc     ON proce_medicos (id_procedimiento)"))
-        pg_db.execute(text("CREATE INDEX idx_pm_servicio ON proce_medicos (servicio)"))
+        pg_db.execute(text("CREATE INDEX idx_pm_servicio ON proce_medicos (lugar_servicio)"))
+        pg_db.execute(text("CREATE INDEX idx_pm_especialidad ON proce_medicos (especialidad)"))
         pg_db.commit()
         print("✅ proce_medicos creada en PostgreSQL")
 
@@ -653,14 +719,28 @@ def pg_migrar_proce_medicos(batch_size: int = 500) -> dict:
 
         for i, fila in enumerate(filas, 1):
             r = dict(fila._mapping)
+            
+            # MAPEO DE VALORES
+            servicio_original = r.get("servicio")
+            servicio_mapeado = mapear_servicio(servicio_original)
+            
+            especialidad_original = r.get("especialidad")
+            especialidad_mapeada = mapear_especialidad(especialidad_original)
+            
+            # Estadísticas de mapeo
+            if servicio_original is not None:
+                stats["mapeos_servicio"][servicio_original] = stats["mapeos_servicio"].get(servicio_original, 0) + 1
+            if especialidad_original is not None:
+                stats["mapeos_especialidad"][especialidad_original] = stats["mapeos_especialidad"].get(especialidad_original, 0) + 1
+            
             batch.append({
                 "fecha":            r.get("fecha"),
-                "servicio":         r.get("servicio"),
+                "lugar_servicio":   servicio_mapeado,  # Campo renombrado y mapeado
                 "sexo":             r.get("sexo"),
                 "id_procedimiento": r.get("id_procedimiento"),
-                "especialidad":     r.get("especialidad"),
+                "especialidad":     especialidad_mapeada,  # Campo mapeado a texto
                 "cantidad":         r.get("cantidad") or 1,
-                "medico":           r.get("medico"),
+                "responsable":      r.get("medico"),
                 "anestesia":        r.get("anestesia") or 0,
                 "created_by":       r.get("created_by"),
                 "created_at":       r.get("created_at") or datetime.now(),
@@ -671,12 +751,12 @@ def pg_migrar_proce_medicos(batch_size: int = 500) -> dict:
                 try:
                     pg_db.execute(text("""
                         INSERT INTO proce_medicos
-                            (fecha, servicio, sexo, id_procedimiento,
-                             especialidad, cantidad, medico, anestesia,
+                            (fecha, lugar_servicio, sexo, id_procedimiento,
+                             especialidad, cantidad, responsable, anestesia,
                              created_by, created_at, updated_at)
                         VALUES
-                            (:fecha, :servicio, :sexo, :id_procedimiento,
-                             :especialidad, :cantidad, :medico, :anestesia,
+                            (:fecha, :lugar_servicio, :sexo, :id_procedimiento,
+                             :especialidad, :cantidad, :responsable, :anestesia,
                              :created_by, :created_at, :updated_at)
                     """), batch)
                     pg_db.commit()
@@ -692,12 +772,12 @@ def pg_migrar_proce_medicos(batch_size: int = 500) -> dict:
             try:
                 pg_db.execute(text("""
                     INSERT INTO proce_medicos
-                        (fecha, servicio, sexo, id_procedimiento,
-                         especialidad, cantidad, medico, anestesia,
+                        (fecha, lugar_servicio, sexo, id_procedimiento,
+                         especialidad, cantidad, responsable, anestesia,
                          created_by, created_at, updated_at)
                     VALUES
-                        (:fecha, :servicio, :sexo, :id_procedimiento,
-                         :especialidad, :cantidad, :medico, :anestesia,
+                        (:fecha, :lugar_servicio, :sexo, :id_procedimiento,
+                         :especialidad, :cantidad, :responsable, :anestesia,
                          :created_by, :created_at, :updated_at)
                 """), batch)
                 pg_db.commit()
@@ -746,6 +826,30 @@ def verificar():
         print(f"   MySQL  proce_medicos_master:   {master:>8,}  (normalizada)")
         print(f"   PG     procedimientos:         {pg_pr:>8,}")
         print(f"   PG     proce_medicos:          {pg_pm:>8,}")
+
+        # Verificar mapeo de servicios
+        print(f"\n📊 Distribución de lugar_servicio en PostgreSQL:")
+        servicios = pg_db.execute(text("""
+            SELECT lugar_servicio, COUNT(*) as total
+            FROM proce_medicos
+            WHERE lugar_servicio IS NOT NULL
+            GROUP BY lugar_servicio
+            ORDER BY total DESC
+        """)).fetchall()
+        for servicio, total in servicios:
+            print(f"   → {servicio:<20} {total:>8,} registros")
+
+        # Verificar mapeo de especialidades
+        print(f"\n📊 Distribución de especialidad en PostgreSQL:")
+        especialidades = pg_db.execute(text("""
+            SELECT especialidad, COUNT(*) as total
+            FROM proce_medicos
+            WHERE especialidad IS NOT NULL
+            GROUP BY especialidad
+            ORDER BY total DESC
+        """)).fetchall()
+        for especialidad, total in especialidades:
+            print(f"   → {especialidad:<30} {total:>8,} registros")
 
         # Integridad: cuántos sin id_procedimiento
         sin_proc = pg_db.execute(text(
@@ -796,7 +900,7 @@ def main():
 
     # ── FASE 2: Migrar a PostgreSQL ──────────────────────────────────────────
     pg_migrar_procedimientos()            # 2-A catálogo
-    stats_pg = pg_migrar_proce_medicos()  # 2-B registros
+    stats_pg = pg_migrar_proce_medicos()  # 2-B registros con mapeo
 
     # ── Verificación ─────────────────────────────────────────────────────────
     verificar()
@@ -815,7 +919,21 @@ def main():
     print(f"  Migración PostgreSQL:")
     print(f"    Migrados exitosos:  {stats_pg['exitosos']:,}")
     print(f"    Errores:            {stats_pg['errores']:,}")
-    print(f"  Tiempo total:         {elapsed:.2f}s")
+    
+    # Mostrar estadísticas de mapeo
+    if stats_pg.get('mapeos_servicio'):
+        print(f"\n  📊 Mapeo de servicios (valores MySQL → texto PG):")
+        for valor, count in sorted(stats_pg['mapeos_servicio'].items()):
+            texto = SERVICIOS_MAP.get(int(valor), 'DESCONOCIDO')
+            print(f"      {valor} → '{texto}' ({count:,} registros)")
+    
+    if stats_pg.get('mapeos_especialidad'):
+        print(f"\n  📊 Mapeo de especialidades (valores MySQL → texto PG):")
+        for valor, count in sorted(stats_pg['mapeos_especialidad'].items()):
+            texto = ESPECIALIDADES_MAP.get(int(valor), 'DESCONOCIDO')
+            print(f"      {valor} → '{texto}' ({count:,} registros)")
+    
+    print(f"\n  Tiempo total:         {elapsed:.2f}s")
     print("=" * 80)
 
     if stats_norm["advertencias"]:
@@ -831,6 +949,10 @@ def main():
     print("     • proce_medicos_backup  (datos originales)")
     print("     • procedimientos        (catálogo normalizado)")
     print("     • proce_medicos_master  (tabla normalizada lista)")
+    print()
+    print("   Tablas PostgreSQL creadas:")
+    print("     • procedimientos        (catálogo)")
+    print("     • proce_medicos         (datos con servicio→lugar_servicio y especialidad mapeada)")
     print()
 
 

@@ -6,13 +6,13 @@ export interface Especialidad {
 }
 
 export const servicio: Especialidad[] = [
-    { value: 1, label: 'Medicina Interna' },
-    { value: 2, label: 'Pediatria' },
-    { value: 3, label: 'Ginecologia y Obstetricia' },
-    { value: 4, label: 'Cirugia' },
-    { value: 5, label: 'Traumatologia' },
-    { value: 6, label: 'Psicologia' },
-    { value: 7, label: 'Nutrición' },
+    { value: 1, label: 'Medicina Interna' }, //'MEDI'
+    { value: 2, label: 'Pediatria' }, //'PEDI'
+    { value: 3, label: 'Ginecologia y Obstetricia' }, //'GINE'
+    { value: 4, label: 'Cirugia' }, //'CIRU'
+    { value: 5, label: 'Traumatologia' }, //'TRAU'
+    { value: 6, label: 'Psicologia' }, //'PSIC'
+    { value: 7, label: 'Nutrición' }, //'NUTR'
 
 
 
@@ -388,12 +388,12 @@ export interface Serv {
 
 
 export const serv: Serv[] = [
-    { value: 1, label: 'COEX' },
-    { value: 2, label: 'Encamamiento' },
-    { value: 3, label: 'Emergencia' },
-    { value: 4, label: 'SOP emergencia' },
-    { value: 5, label: 'SOP electiva' },
-    { value: 6, label: 'Maternidad' },
+    { value: 1, label: 'COEX' }, // 'COEX'
+    { value: 2, label: 'Encamamiento' }, // 'ENCA' 
+    { value: 3, label: 'Emergencia' }, // 'EMER'
+    { value: 4, label: 'SOP emergencia' }, // 'SOEM
+    { value: 5, label: 'SOP electiva' }, // 'SOEL'
+    { value: 6, label: 'Maternidad' }, // 'MATE'
 ]
 
 export interface Tipo_citas {
