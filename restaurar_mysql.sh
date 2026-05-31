@@ -9,7 +9,7 @@
 # -------- CONFIGURACIÓN --------
 DB_NAME="test_api"
 DB_USER="root"
-SQL_FILE="base.sql"
+SQL_FILE="/Users/macbookairm2/base.sql"
 
 # -------- VALIDACIONES --------
 
