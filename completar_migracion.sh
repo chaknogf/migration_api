@@ -43,6 +43,10 @@ echo "[7/8] Migrando citas..."
 python3 migrate_citas.py
 
 echo ""
+echo "[/8] Migrando uisau..."
+python3 migrate_uisau.py
+
+echo ""
 echo "[8/8] Generando y enviando backup PostgreSQL..."
 python3 backup_postgres.py
 
